@@ -23,11 +23,11 @@ kernel:
 
 disk: build
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 2>/dev/null
-	printf ',,0x0C,*\n' | sfdisk $(DISK_IMG) 2>/dev/null > /dev/null
 	./scripts/mkdisk.sh $(DISK_IMG) $(KERNEL_ELF) $(LIMINE_DIR)
 
 run: disk
-	@qemu-system-x86_64 -hda $(DISK_IMG) -m 256M -no-reboot -nographic -device isa-debug-exit
+	@qemu-system-x86_64 -hda $(DISK_IMG) -m 256M -no-reboot -nographic \
+		-bios /usr/share/ovmf/OVMF.fd -device isa-debug-exit
 	@rm -f $(DISK_IMG)
 
 clean:
