@@ -1,9 +1,3 @@
-/*！
-
-本模块利用 log crate 为你提供了日志功能，使用方式见 main.rs.
-
-*/
-
 use log::{self, Level, LevelFilter, Log, Metadata, Record};
 
 struct SimpleLogger;
@@ -17,11 +11,11 @@ impl Log for SimpleLogger {
             return;
         }
         let color = match record.level() {
-            Level::Error => 31, // Red
-            Level::Warn => 93,  // BrightYellow
-            Level::Info => 34,  // Blue
-            Level::Debug => 32, // Green
-            Level::Trace => 90, // BrightBlack
+            Level::Error => 31,
+            Level::Warn => 93,
+            Level::Info => 34,
+            Level::Debug => 32,
+            Level::Trace => 90,
         };
         println!(
             "\u{1B}[{}m[{:>5}] {}\u{1B}[0m",
