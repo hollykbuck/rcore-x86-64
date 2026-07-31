@@ -1,34 +1,46 @@
-//! Timer setup (local APIC timer for preemption + CMOS RTC for timekeeping)
+//! Timer setup (local APIC timer for both preemption and timekeeping)
 //!
 //! Limine masks both the 8259 PICs and the IO-APIC before handing over, and
 //! the legacy PIT path is unreliable under QEMU's TCG emulation (interrupts
 //! are easily lost when the handler is slow). The local APIC timer, on the
 //! other hand, fires as reliably as the RISC-V CLINT timer, so it is used for
-//! the time-slice rotation (round-robin preemption).
+//! both the time-slice rotation (round-robin preemption) and as the time
+//! source.
 //!
-//! The preemption rate is set to 1000 Hz: QEMU's TCG emulation only advances
-//! its virtual clock (and thus fires timers) when the guest does I/O or runs
-//! under `-icount`, so a high nominal rate is needed for the round-robin to
-//! visibly preempt the compute-bound power apps.
+//! The preemption rate is set to 1000 Hz. QEMU's TCG only advances its
+//! virtual clock in real time or under `-icount`, so `-icount shift=auto` is
+//! recommended to make the time slices evenly instruction-budgeted rather
+//! than host-load dependent (see HANDOVER §5.5).
 //!
-//! Wall-clock time, however, must not depend on how often the slow handler
-//! happens to run nor on how fast the emulator's virtual clock advances, so
-//! `get_time_ms` is derived from the CMOS RTC, which is wall-clock accurate
-//! (1 s resolution, made monotonic across minute wraps by the timer handler).
-//! The 03sleep test only needs ~3 s precision.
+//! Timekeeping reconstructs a free-running monotonic counter from the APIC
+//! timer, the x86-64 analogue of the RISC-V `mtime`:
+//!
+//! - In periodic mode the current-count register (FEE0 0390H / x2APIC MSR
+//!   0x839) is automatically reloaded from the initial-count register each
+//!   time the count reaches zero (Intel SDM Vol. 3A §13.5.4).
+//! - So `elapsed_ticks = wraps * INITIAL_COUNT + (INITIAL_COUNT - current)`
+//!   is a free-running monotonic counter at `APIC_TIMER_FREQ` ticks/second.
+//! - The kernel runs with IF=0, so the timer interrupt cannot preempt the two
+//!   reads inside `elapsed_ticks()`: `wraps` and `current` are always
+//!   mutually consistent, and the counter is inherently monotonic.
 //!
 //! The APIC timer input frequency is exactly 1 GHz on QEMU (measured: a count
-//! of 10,000,000 gives 100 Hz), so the count for `TICKS_PER_SEC` Hz is
-//! `APIC_TIMER_FREQ / TICKS_PER_SEC`.
+//! of 10,000,000 gives 100 Hz). On real hardware it is the bus/crystal clock
+//! (SDM §13.5.4), so the hardcoded 1 GHz only holds for QEMU -- fine for this
+//! tutorial. No RTC is involved anymore: the counter is guest-side and
+//! inherently monotonic, so the previous RTC + minute-wrap bookkeeping is
+//! gone.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicI8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use log::*;
 
 /// number of timer interrupts per second (the preemption rate)
 const TICKS_PER_SEC: usize = 1000;
 /// the APIC timer input frequency, measured on QEMU (1 GHz)
-const APIC_TIMER_FREQ: u64 = 1_000_000_000;
+const APIC_TIMER_FREQ: usize = 1_000_000_000;
+/// the count programmed into the APIC timer (period = INITIAL_COUNT ns)
+const INITIAL_COUNT: usize = APIC_TIMER_FREQ / TICKS_PER_SEC;
 
 /// the MSR holding the local APIC base/enable state
 const APIC_BASE_MSR: u32 = 0x1B;
@@ -39,36 +51,11 @@ const APIC_BASE_X2: u64 = 1 << 10;
 const LAPIC_EOI: u32 = 0x0B0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_TIMER_INIT_COUNT: u32 = 0x380;
+const LAPIC_TIMER_CURRENT_COUNT: u32 = 0x390;
 const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 
-/// the CMOS RTC ports and registers
-const RTC_PORT: u16 = 0x70;
-const RTC_DATA: u16 = 0x71;
-/// RTC register A, bit 7 = update in progress
-const RTC_REG_A: u8 = 0x0A;
-/// RTC seconds register
-const RTC_REG_SECONDS: u8 = 0x00;
-
-/// number of timer ticks since boot (informational only)
-static TICKS: AtomicUsize = AtomicUsize::new(0);
-/// the last RTC seconds value seen, `-1` before the first read
-static LAST_RTC_SEC: AtomicI8 = AtomicI8::new(-1);
-/// seconds accumulated across RTC minute wraps, to keep time monotonic
-static BASE_SECONDS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe fn outb(port: u16, value: u8) {
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value, options(nostack));
-    }
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe {
-        asm!("in al, dx", out("al") value, in("dx") port, options(nostack));
-    }
-    value
-}
+/// number of completed timer periods (interrupts delivered) since boot
+static WRAPS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn rdmsr(msr: u32) -> u64 {
     let mut hi: u32;
@@ -111,42 +98,28 @@ fn lapic_write(offset: u32, value: u32) {
     }
 }
 
-/// Wait until the RTC is not updating (register A bit 7, UIP, is clear).
-fn rtc_wait_update_done() {
+/// Read a local APIC register. Works in both xAPIC (MMIO) and x2APIC (MSR)
+/// modes.
+fn lapic_read(offset: u32) -> u32 {
     unsafe {
-        outb(RTC_PORT, RTC_REG_A); // select register A
-        while inb(RTC_DATA) & 0x80 != 0 {}
+        let apic_base = rdmsr(APIC_BASE_MSR);
+        if apic_base & APIC_BASE_X2 != 0 {
+            rdmsr(0x800 + offset) as u32
+        } else {
+            let base = (apic_base & !0xFFF) as *const u32;
+            core::ptr::read_volatile(base.add((offset / 4) as usize))
+        }
     }
 }
 
-/// Read a CMOS RTC register, waiting for any update in progress to finish.
-fn rtc_read(reg: u8) -> u8 {
-    rtc_wait_update_done();
-    unsafe {
-        outb(RTC_PORT, reg);
-        inb(RTC_DATA)
-    }
-}
-
-/// Decode a BCD value (0x00-0x59) to binary.
-fn bcd_to_bin(bcd: u8) -> u8 {
-    (bcd & 0x0F) + ((bcd >> 4) & 0x0F) * 10
-}
-
-/// The current RTC seconds value (0..59).
-fn rtc_seconds() -> u8 {
-    bcd_to_bin(rtc_read(RTC_REG_SECONDS))
-}
-
-/// A monotonic seconds value based on the RTC, accounting for minute wraps.
-fn rtc_monotonic_seconds() -> usize {
-    let sec = rtc_seconds() as i8;
-    let last = LAST_RTC_SEC.swap(sec, Ordering::Relaxed);
-    if last >= 0 && sec < last {
-        // the RTC seconds wrapped from 59 back to 0
-        BASE_SECONDS.fetch_add(60, Ordering::Relaxed);
-    }
-    BASE_SECONDS.load(Ordering::Relaxed) + sec as usize
+/// A free-running monotonic tick counter, the analogue of the RISC-V `mtime`.
+///
+/// Reconstructed from the periodic APIC timer: `wraps` counts full periods
+/// delivered by the interrupt handler, and `INITIAL_COUNT - current` is the
+/// number of ticks elapsed within the current period.
+fn elapsed_ticks() -> usize {
+    let current = lapic_read(LAPIC_TIMER_CURRENT_COUNT) as usize;
+    WRAPS.load(Ordering::Relaxed) * INITIAL_COUNT + (INITIAL_COUNT - current)
 }
 
 /// Initialize the timer: program the APIC timer in periodic mode to interrupt
@@ -157,19 +130,14 @@ pub fn init() {
     // periodic mode, vector 32, unmasked
     lapic_write(LAPIC_LVT_TIMER, 0x20 | (1 << 17));
     // count for TICKS_PER_SEC Hz
-    lapic_write(
-        LAPIC_TIMER_INIT_COUNT,
-        (APIC_TIMER_FREQ / TICKS_PER_SEC as u64) as u32,
-    );
+    lapic_write(LAPIC_TIMER_INIT_COUNT, INITIAL_COUNT as u32);
     info!("timer: APIC timer interrupt at ~{} Hz", TICKS_PER_SEC);
 }
 
-/// Count one timer tick. Called from the timer interrupt handler.
-///
-/// Also keeps the RTC minute-wrap bookkeeping up to date.
+/// Count one timer interrupt (one full period elapsed). Called from the timer
+/// interrupt handler.
 pub fn tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
-    let _ = rtc_monotonic_seconds();
+    WRAPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Send the End-Of-Interrupt to the local APIC. Must be called at the start
@@ -180,11 +148,10 @@ pub fn timer_eoi() {
 
 /// get current time in milliseconds
 ///
-/// Derived from the CMOS RTC, which is wall-clock accurate regardless of how
-/// many timer interrupts the emulator actually delivers. Resolution is 1 s,
-/// which is enough for the `03sleep` test (waits ~3000 ms).
+/// Derived from the monotonic APIC-timer counter, so the resolution is 1 ms
+/// (and monotonic by construction).
 pub fn get_time_ms() -> usize {
-    rtc_monotonic_seconds() * 1000
+    elapsed_ticks() / (APIC_TIMER_FREQ / 1000)
 }
 
 /// set the next timer interrupt
