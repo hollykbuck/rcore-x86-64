@@ -1,37 +1,28 @@
 //! batch subsystem
 
-use crate::sbi::shutdown;
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
-use core::arch::asm;
+use crate::uart::shutdown;
 use lazy_static::*;
 
-const USER_STACK_SIZE: usize = 4096 * 2;
-const KERNEL_STACK_SIZE: usize = 4096 * 2;
 const MAX_APP_NUM: usize = 16;
-const APP_BASE_ADDRESS: usize = 0x80400000;
+const APP_BASE_ADDRESS: usize = 0x8000000;
 const APP_SIZE_LIMIT: usize = 0x20000;
+/// the top of the app's user stack, which lives right above the app area in
+/// the (identity-mapped, user-accessible) low memory
+const USER_STACK_TOP: usize = APP_BASE_ADDRESS + APP_SIZE_LIMIT + 0x10000;
 
-#[repr(align(4096))]
-struct KernelStack {
-    data: [u8; KERNEL_STACK_SIZE],
-}
-
-#[repr(align(4096))]
-struct UserStack {
-    data: [u8; USER_STACK_SIZE],
-}
-
-static KERNEL_STACK: KernelStack = KernelStack {
-    data: [0; KERNEL_STACK_SIZE],
-};
-static USER_STACK: UserStack = UserStack {
-    data: [0; USER_STACK_SIZE],
-};
+/// The kernel stack used for trap handling. The stack itself is allocated in
+/// `trap.S` (`trap_stack_top`); it is also pointed to by the `rsp0` field of
+/// the TSS, so that exceptions in user mode automatically switch to it.
+struct KernelStack;
 
 impl KernelStack {
     fn get_sp(&self) -> usize {
-        self.data.as_ptr() as usize + KERNEL_STACK_SIZE
+        unsafe extern "C" {
+            safe fn trap_stack_top();
+        }
+        linker_symbol_addr!(trap_stack_top)
     }
     pub fn push_context(&self, cx: TrapContext) -> &'static mut TrapContext {
         let cx_ptr = (self.get_sp() - core::mem::size_of::<TrapContext>()) as *mut TrapContext;
@@ -42,11 +33,7 @@ impl KernelStack {
     }
 }
 
-impl UserStack {
-    fn get_sp(&self) -> usize {
-        self.data.as_ptr() as usize + USER_STACK_SIZE
-    }
-}
+static KERNEL_STACK: KernelStack = KernelStack;
 
 struct AppManager {
     num_app: usize,
@@ -83,13 +70,6 @@ impl AppManager {
             let app_dst =
                 core::slice::from_raw_parts_mut(APP_BASE_ADDRESS as *mut u8, app_src.len());
             app_dst.copy_from_slice(app_src);
-            // Memory fence about fetching the instruction memory
-            // It is guaranteed that a subsequent instruction fetch must
-            // observes all previous writes to the instruction memory.
-            // Therefore, fence.i must be executed after we have loaded
-            // the code of the next app into the instruction memory.
-            // See also: riscv non-priv spec chapter 3, 'Zifencei' extension.
-            asm!("fence.i");
         }
     }
 
@@ -148,7 +128,7 @@ pub fn run_next_app() -> ! {
     unsafe {
         __restore(KERNEL_STACK.push_context(TrapContext::app_init_context(
             APP_BASE_ADDRESS,
-            USER_STACK.get_sp(),
+            USER_STACK_TOP,
         )) as *const _ as usize);
     }
     panic!("Unreachable in batch::run_current_app!");

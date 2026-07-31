@@ -7,9 +7,9 @@
 //! - [`syscall`]: System call handling and implementation
 //!
 //! The operating system also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
-//! initialize various pieces of functionality. (See its source code for
-//! details.)
+//! executing from `_start` (defined in `limine_reqs.rs`), after which
+//! [`rust_main()`] is called to initialize various pieces of functionality.
+//! (See its source code for details.)
 //!
 //! We then call [`batch::run_next_app()`] and for the first time go to
 //! userspace.
@@ -32,13 +32,13 @@ use log::*;
 mod console;
 pub mod batch;
 mod lang_items;
+mod limine_reqs;
 mod logging;
-mod sbi;
 mod sync;
 pub mod syscall;
 pub mod trap;
+mod uart;
 
-global_asm!(include_str!("entry.asm"));
 global_asm!(include_str!("link_app.S"));
 
 /// clear BSS segment
@@ -59,6 +59,12 @@ fn clear_bss() {
 /// the rust entry-point of os
 #[unsafe(no_mangle)]
 pub fn rust_main() -> ! {
+    uart::init();
+    clear_bss();
+    logging::init();
+
+    println!("[kernel] Hello, world!");
+
     unsafe extern "C" {
         safe fn stext(); // begin addr of text segment
         safe fn etext(); // end addr of text segment
@@ -71,9 +77,6 @@ pub fn rust_main() -> ! {
         safe fn boot_stack_lower_bound(); // stack lower bound
         safe fn boot_stack_top(); // stack top
     }
-    clear_bss();
-    logging::init();
-    println!("[kernel] Hello, world!");
     trace!(
         "[kernel] .text [{:#x}, {:#x})",
         linker_symbol_addr!(stext),
@@ -90,7 +93,7 @@ pub fn rust_main() -> ! {
         linker_symbol_addr!(edata)
     );
     warn!(
-        "[kernel] boot_stack top=bottom={:#x}, lower_bound={:#x}",
+        "[kernel] boot_stack top={:#x}, bottom={:#x}",
         linker_symbol_addr!(boot_stack_top),
         linker_symbol_addr!(boot_stack_lower_bound)
     );
@@ -99,6 +102,7 @@ pub fn rust_main() -> ! {
         linker_symbol_addr!(sbss),
         linker_symbol_addr!(ebss)
     );
+
     trap::init();
     batch::init();
     batch::run_next_app();

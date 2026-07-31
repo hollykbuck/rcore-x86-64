@@ -9,6 +9,10 @@
 
 os/src/link_app.S
 os/src/linker.ld
+os/os.iso
+os/disk.img
+bootloader/limine-*
+bootloader/.limine-*
 os/last-*
 os/Cargo.lock
 os/.gdb_history

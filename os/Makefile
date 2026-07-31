@@ -1,84 +1,57 @@
-# Building
-TARGET := riscv64gc-unknown-none-elf
+TARGET := x86_64-unknown-none
 MODE := release
 KERNEL_ELF := target/$(TARGET)/$(MODE)/os
-KERNEL_BIN := $(KERNEL_ELF).bin
-DISASM_TMP := target/$(TARGET)/$(MODE)/asm
 
-# Building mode argument
-ifeq ($(MODE), release)
-	MODE_ARG := --release
-endif
+LIMINE_VERSION := 12.5.2
+LIMINE_DIR := $(abspath ../bootloader/limine-$(LIMINE_VERSION))
+LIMINE_STAMP := $(abspath ../bootloader/.limine-$(LIMINE_VERSION))
+DISK_IMG := disk.img
 
-# BOARD
-BOARD := qemu
-SBI ?= rustsbi
-BOOTLOADER := ../bootloader/$(SBI)-$(BOARD).bin
+OBJDUMP := rust-objdump
+OBJCOPY := rust-objcopy
 
-# KERNEL ENTRY
-KERNEL_ENTRY_PA := 0x80200000
-
-# Binutils
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
-
-# Disassembly
-DISASM ?= -x
-
-build: env $(KERNEL_BIN)
+build: env $(KERNEL_ELF)
 
 env:
-	(rustup target list | grep "riscv64gc-unknown-none-elf (installed)") || rustup target add $(TARGET)
+	(rustup target list | grep "$(TARGET) (installed)") || rustup target add $(TARGET)
 	(command -v rust-objcopy >/dev/null && command -v rust-objdump >/dev/null) || cargo install cargo-binutils
 	rustup component add rust-src
 	rustup component add llvm-tools-preview
+	if [ ! -f "$(LIMINE_STAMP)" ]; then \
+		echo "  Downloading Limine $(LIMINE_VERSION)..."; \
+		gh release download --clobber --repo limine-bootloader/limine -p "limine-binary.tar.gz" \
+			-D /tmp/ && \
+		mkdir -p "$(LIMINE_DIR)" && \
+		tar xzf /tmp/limine-binary.tar.gz -C "$(LIMINE_DIR)" --strip-components=1 && \
+		rm -f /tmp/limine-binary.tar.gz && \
+		$(MAKE) -C "$(LIMINE_DIR)" && \
+		touch "$(LIMINE_STAMP)"; \
+	fi
 
-$(KERNEL_BIN): kernel
-	@$(OBJCOPY) $(KERNEL_ELF) --strip-all -O binary $@
+$(KERNEL_ELF): kernel
 
 kernel:
 	@cd ../user && make build
-	@echo Platform: $(BOARD)
-	@cp src/linker-$(BOARD).ld src/linker.ld
-	@cargo build $(MODE_ARG)
-	@rm src/linker.ld
+	@cargo build --release
 
+disk: build
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 2>/dev/null
+	./scripts/mkdisk.sh $(DISK_IMG) $(KERNEL_ELF) $(LIMINE_DIR)
+
+run: disk
+	@qemu-system-x86_64 -hda $(DISK_IMG) -m 256M -no-reboot -nographic \
+		-bios /usr/share/ovmf/OVMF.fd -device isa-debug-exit
+	@rm -f $(DISK_IMG)
 
 clean:
 	@cargo clean
+	@rm -f $(DISK_IMG) os.iso
+	@rm -rf iso_root
+
+distclean: clean
+	@rm -rf $(LIMINE_DIR) $(LIMINE_STAMP)
 
 disasm: kernel
-	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less
+	@$(OBJDUMP) -d $(KERNEL_ELF) | less
 
-disasm-vim: kernel
-	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) > $(DISASM_TMP)
-	@vim $(DISASM_TMP)
-	@rm $(DISASM_TMP)
-
-run: run-inner
-
-QEMU_ARGS := -machine virt \
-			 -nographic \
-			 -bios $(BOOTLOADER) \
-			 -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA)
-
-QEMU_NAME := qemu-system-riscv64
-qemu-version-check:
-	@sh scripts/qemu-ver-check.sh $(QEMU_NAME)
-
-run-inner: qemu-version-check build
-	@qemu-system-riscv64 $(QEMU_ARGS)
-
-debug: qemu-version-check build
-	@tmux new-session -d \
-		"qemu-system-riscv64 $(QEMU_ARGS) -s -S" && \
-		tmux split-window -h "riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'" && \
-		tmux -2 attach-session -d
-
-gdbserver: qemu-version-check build
-	@qemu-system-riscv64 $(QEMU_ARGS) -s -S
-
-gdbclient:
-	@riscv64-unknown-elf-gdb -ex 'file $(KERNEL_ELF)' -ex 'set arch riscv:rv64' -ex 'target remote localhost:1234'
-
-.PHONY: build env kernel clean disasm disasm-vim run-inner gdbserver gdbclient qemu-version-check
+.PHONY: build env kernel disk run clean distclean disasm
