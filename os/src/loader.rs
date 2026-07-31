@@ -2,12 +2,16 @@
 //!
 //! For chapter 3, user applications are simply part of the data included in the
 //! kernel binary, so we only need to copy them to the space allocated for each
-//! app to load them. We also allocate fixed spaces for each task's
-//! [`KernelStack`] and [`UserStack`].
+//! app to load them. We also allocate a fixed kernel stack for each task and
+//! compute a fixed user stack region for it.
+//!
+//! On x86-64 the kernel stacks live in the kernel `.bss` (supervisor-only,
+//! used by trap handling). The user stacks must be placed in the low
+//! identity-mapped, user-accessible memory, since the ring-3 applications
+//! cannot touch the kernel's pages.
 
 use crate::config::*;
 use crate::trap::TrapContext;
-use core::arch::asm;
 
 #[repr(align(4096))]
 #[derive(Copy, Clone)]
@@ -15,18 +19,8 @@ struct KernelStack {
     data: [u8; KERNEL_STACK_SIZE],
 }
 
-#[repr(align(4096))]
-#[derive(Copy, Clone)]
-struct UserStack {
-    data: [u8; USER_STACK_SIZE],
-}
-
 static KERNEL_STACK: [KernelStack; MAX_APP_NUM] = [KernelStack {
     data: [0; KERNEL_STACK_SIZE],
-}; MAX_APP_NUM];
-
-static USER_STACK: [UserStack; MAX_APP_NUM] = [UserStack {
-    data: [0; USER_STACK_SIZE],
 }; MAX_APP_NUM];
 
 impl KernelStack {
@@ -42,10 +36,16 @@ impl KernelStack {
     }
 }
 
-impl UserStack {
-    fn get_sp(&self) -> usize {
-        self.data.as_ptr() as usize + USER_STACK_SIZE
-    }
+/// Get the top of task `app_id`'s kernel stack. Must be kept in sync with the
+/// TSS `rsp0` (see [`crate::trap::set_current_stack_top`]).
+pub fn kernel_stack_top(app_id: usize) -> usize {
+    KERNEL_STACK[app_id].get_sp()
+}
+
+/// The user stack of task `app_id` lives right above the whole app area, in
+/// the low identity-mapped (user-accessible) memory.
+fn user_stack_top(app_id: usize) -> usize {
+    APP_BASE_ADDRESS + MAX_APP_NUM * APP_SIZE_LIMIT + (app_id + 1) * USER_STACK_SIZE
 }
 
 /// Get base address of app i.
@@ -83,21 +83,15 @@ pub fn load_apps() {
         let dst = unsafe { core::slice::from_raw_parts_mut(base_i as *mut u8, src.len()) };
         dst.copy_from_slice(src);
     }
-    // Memory fence about fetching the instruction memory
-    // It is guaranteed that a subsequent instruction fetch must
-    // observes all previous writes to the instruction memory.
-    // Therefore, fence.i must be executed after we have loaded
-    // the code of the next app into the instruction memory.
-    // See also: riscv non-priv spec chapter 3, 'Zifencei' extension.
-    unsafe {
-        asm!("fence.i");
-    }
+    // No instruction-fetch fence is needed on x86-64: the instruction cache is
+    // coherent with the data written here, and no instruction is fetched from
+    // these pages before the first `iretq` to the app anyway.
 }
 
 /// get app info with entry and sp and save `TrapContext` in kernel stack
 pub fn init_app_cx(app_id: usize) -> usize {
     KERNEL_STACK[app_id].push_context(TrapContext::app_init_context(
         get_base_i(app_id),
-        USER_STACK[app_id].get_sp(),
+        user_stack_top(app_id),
     ))
 }

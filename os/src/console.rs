@@ -1,6 +1,6 @@
-//! SBI console driver, for text output
+//! Console output macros
 
-use crate::sbi::console_putchar;
+use crate::uart::console_putchar;
 use core::fmt::{self, Write};
 
 struct Stdout;

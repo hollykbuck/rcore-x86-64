@@ -16,9 +16,10 @@ mod switch;
 mod task;
 
 use crate::config::MAX_APP_NUM;
-use crate::loader::{get_num_app, init_app_cx};
-use crate::sbi::shutdown;
+use crate::loader::{get_num_app, init_app_cx, kernel_stack_top};
 use crate::sync::UPSafeCell;
+use crate::trap::set_current_stack_top;
+use crate::uart::shutdown;
 use lazy_static::*;
 use switch::__switch;
 use task::{TaskControlBlock, TaskStatus};
@@ -83,6 +84,10 @@ impl TaskManager {
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+        // x86-64: the CPU needs to know the current task's kernel stack so
+        // that a user-mode trap (timer interrupt / exception / syscall) lands
+        // on the right stack.
+        set_current_stack_top(kernel_stack_top(0) as u64);
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -127,6 +132,9 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            // x86-64: keep the CPU's view of the current kernel stack in sync
+            // with the task we are about to switch to.
+            set_current_stack_top(kernel_stack_top(next) as u64);
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
