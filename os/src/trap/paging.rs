@@ -14,8 +14,9 @@
 //!
 //! The kernel is loaded by Limine at an arbitrary physical address, so we
 //! recover the exact physical location by walking Limine's own page tables
-//! (accessible through the higher-half direct map) rather than trusting the
-//! `limine_executable_address_request` response.
+//! (accessible through the higher-half direct map). This is equivalent to the
+//! `limine_executable_address_request` response on Limine 12.5.2 (both match,
+//! delta = 0) but does not depend on the ELF segment alignment logic.
 
 // The page tables are installed once at boot, so `static mut` (via raw
 // pointers where needed) is fine here.
