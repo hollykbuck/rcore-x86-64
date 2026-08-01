@@ -1,10 +1,20 @@
+//! Signal definitions, taken from the RISC-V tutorial (ch7) verbatim: a
+//! process's pending signals live in a `SignalFlags` bitset where signal `n`
+//! occupies bit `n`.
+
+// the per-signal bits are self-explanatory
+#![allow(missing_docs)]
+
 use bitflags::*;
 
+/// the number of the highest supported signal
 pub const MAX_SIG: usize = 31;
 
 bitflags! {
+    /// The set of pending signals of a process: signal `n` occupies bit `n`
     pub struct SignalFlags: u32 {
-        const SIGDEF = 1; // Default signal handling
+        /// Default signal handling
+        const SIGDEF = 1;
         const SIGHUP = 1 << 1;
         const SIGINT = 1 << 2;
         const SIGQUIT = 1 << 3;
@@ -40,6 +50,8 @@ bitflags! {
 }
 
 impl SignalFlags {
+    /// The default action of an error signal is to kill the process with a
+    /// negative exit code, mirroring the RISC-V tutorial.
     pub fn check_error(&self) -> Option<(i32, &'static str)> {
         if self.contains(Self::SIGINT) {
             Some((-2, "Killed, SIGINT=2"))
@@ -54,7 +66,6 @@ impl SignalFlags {
         } else if self.contains(Self::SIGSEGV) {
             Some((-11, "Segmentation Fault, SIGSEGV=11"))
         } else {
-            //println!("[K] signalflags check_error  {:?}", self);
             None
         }
     }

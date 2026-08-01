@@ -1,4 +1,6 @@
-use crate::sbi::shutdown;
+//! The panic handler
+
+use crate::uart::shutdown;
 use core::panic::PanicInfo;
 use log::*;
 

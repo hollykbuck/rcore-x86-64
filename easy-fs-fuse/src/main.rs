@@ -80,6 +80,9 @@ fn easy_fs_pack() -> std::io::Result<()> {
         // write data to easy-fs
         inode.write_at(0, all_data.as_slice());
     }
+    // pre-create the `filea` file used by `cat filea`/`cat_filea`
+    let filea = root_inode.create("filea").unwrap();
+    filea.write_at(0, b"Hello, world!");
     // list apps
     // for app in root_inode.ls() {
     //     println!("{}", app);

@@ -1,29 +1,31 @@
-TARGET := riscv64gc-unknown-none-elf
+TARGET := x86_64-unknown-none
 MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 APPS := $(wildcard $(APP_DIR)/*.rs)
 ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
-BINS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%.bin, $(APPS))
 
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
-CP := cp 
+OBJDUMP := rust-objdump
+CP := cp
 
-TEST ?= 
+TEST ?=
 
-elf: $(APPS)
+# every app is an independent ELF linked at the same base address
+# (BASE_ADDRESS in src/linker.ld); the kernel parses the ELF program headers
+# itself, so no per-app relocation and no `.bin` blobs are needed.
+# The `touch` below forces cargo to re-link `initproc`: `make run TEST=1`
+# overwrites `target/.../initproc` with `usertests`, and without it cargo would
+# consider the (tampered) product up to date on the next build.
+build: $(APPS)
+	@touch src/bin/initproc.rs
 	@cargo build --release
 ifeq ($(TEST), 1)
 	@$(CP) $(TARGET_DIR)/usertests $(TARGET_DIR)/initproc
 endif
 
-binary: elf
-	@$(foreach elf, $(ELFS), $(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf));)
-
-build: binary
+elf: build
 
 clean:
 	@cargo clean
 
-.PHONY: elf binary build clean
+.PHONY: build elf clean

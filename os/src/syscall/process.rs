@@ -1,3 +1,4 @@
+//! Process management syscalls
 use crate::fs::{OpenFlags, open_file};
 use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
@@ -9,38 +10,40 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+/// task exits and submit an exit code
 pub fn sys_exit(exit_code: i32) -> ! {
-    exit_current_and_run_next(exit_code);
-    panic!("Unreachable in sys_exit!");
+    exit_current_and_run_next(exit_code)
 }
 
+/// current task gives up resources for other tasks
 pub fn sys_yield() -> isize {
     suspend_current_and_run_next();
     0
 }
 
+/// get time in milliseconds
 pub fn sys_get_time() -> isize {
     get_time_ms() as isize
 }
 
+/// get the pid of the current task
 pub fn sys_getpid() -> isize {
     current_task().unwrap().pid.0 as isize
 }
 
+/// create a child process, which is a copy of the current one
 pub fn sys_fork() -> isize {
     let current_task = current_task().unwrap();
     let new_task = current_task.fork();
     let new_pid = new_task.pid.0;
-    // modify trap context of new_task, because it returns immediately after switching
-    let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
-    // we do not have to move to next instruction since we have done it before
-    // for child process, fork returns 0
-    trap_cx.x[10] = 0;
     // add new task to scheduler
     add_task(new_task);
     new_pid as isize
 }
 
+/// replace the current process with the program named by `path`, which is
+/// loaded from the file system; `args` is a NUL-terminated array of argument
+/// string pointers in the user address space.
 pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
     let path = translated_str(token, path);
@@ -60,7 +63,7 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
         let task = current_task().unwrap();
         let argc = args_vec.len();
         task.exec(all_data.as_slice(), args_vec);
-        // return argc because cx.x[10] will be covered with it later
+        // return argc because cx.rdi will be covered with it later
         argc as isize
     } else {
         -1
@@ -73,7 +76,7 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     let task = current_task().unwrap();
     // find a child process
 
-    // ---- access current PCB exclusively
+    // ---- access current TCB exclusively
     let mut inner = task.inner_exclusive_access();
     if !inner
         .children
@@ -84,26 +87,31 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         // ---- release current PCB
     }
     let pair = inner.children.iter().enumerate().find(|(_, p)| {
-        // ++++ temporarily access child PCB exclusively
+        // ++++ temporarily access child PCB lock exclusively
         p.inner_exclusive_access().is_zombie() && (pid == -1 || pid as usize == p.getpid())
         // ++++ release child PCB
     });
     if let Some((idx, _)) = pair {
         let child = inner.children.remove(idx);
-        // confirm that child will be deallocated after being removed from children list
+        // confirm that child will be deallocated after removing from children list
         assert_eq!(Arc::strong_count(&child), 1);
         let found_pid = child.getpid();
-        // ++++ temporarily access child PCB exclusively
+        // ++++ temporarily access child TCB exclusively
         let exit_code = child.inner_exclusive_access().exit_code;
         // ++++ release child PCB
-        *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
+        // x86-64: the trap handler runs on this task's page table, so the user
+        // pointer is directly dereferenceable
+        unsafe {
+            *exit_code_ptr = exit_code;
+        }
         found_pid as isize
     } else {
         -2
     }
-    // ---- release current PCB automatically
+    // ---- release current PCB lock automatically
 }
 
+/// Send the signal `signum` to the process `pid`, if it is legal.
 pub fn sys_kill(pid: usize, signum: i32) -> isize {
     if let Some(task) = pid2task(pid) {
         if let Some(flag) = SignalFlags::from_bits(1 << signum) {
@@ -122,6 +130,7 @@ pub fn sys_kill(pid: usize, signum: i32) -> isize {
     }
 }
 
+/// Change the signal mask of the current process, returning the old mask.
 pub fn sys_sigprocmask(mask: u32) -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
@@ -137,6 +146,12 @@ pub fn sys_sigprocmask(mask: u32) -> isize {
     }
 }
 
+/// Return from a user signal handler: restore the trap context saved when the
+/// handler was entered.
+///
+/// x86-64 note: the syscall return value goes in `rax`, and after the trap
+/// context is restored the original user code resumes, so the value returned
+/// here is the one saved in `rax`.
 pub fn sys_sigreturn() -> isize {
     if let Some(task) = current_task() {
         let mut inner = task.inner_exclusive_access();
@@ -144,10 +159,10 @@ pub fn sys_sigreturn() -> isize {
         // restore the trap context
         let trap_ctx = inner.get_trap_cx();
         *trap_ctx = inner.trap_ctx_backup.unwrap();
-        // Here we return the value of a0 in the trap_ctx,
+        // Here we return the value of rax in the trap_ctx,
         // otherwise it will be overwritten after we trap
         // back to the original execution of the application.
-        trap_ctx.x[10] as isize
+        trap_ctx.rax as isize
     } else {
         -1
     }
@@ -165,6 +180,8 @@ fn check_sigaction_error(signal: SignalFlags, action: usize, old_action: usize) 
     }
 }
 
+/// Set the action of `signum`, returning the previous action through
+/// `old_action`.
 pub fn sys_sigaction(
     signum: i32,
     action: *const SignalAction,

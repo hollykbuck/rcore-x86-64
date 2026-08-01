@@ -1,23 +1,28 @@
+//! Implementation of [`TaskManager`]
 use super::TaskControlBlock;
 use crate::sync::UPSafeCell;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use lazy_static::*;
 
+/// A ready queue of `TaskControlBlock`s
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 /// A simple FIFO scheduler.
 impl TaskManager {
+    /// Create an empty TaskManager
     pub fn new() -> Self {
         Self {
             ready_queue: VecDeque::new(),
         }
     }
+    /// Add a task to the ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
+    /// Remove the first task and return it, or `None` if the queue is empty
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
     }
@@ -26,10 +31,12 @@ impl TaskManager {
 lazy_static! {
     pub static ref TASK_MANAGER: UPSafeCell<TaskManager> =
         unsafe { UPSafeCell::new(TaskManager::new()) };
+    /// a pid -> TCB map, used to send signals to a specific process
     pub static ref PID2TCB: UPSafeCell<BTreeMap<usize, Arc<TaskControlBlock>>> =
         unsafe { UPSafeCell::new(BTreeMap::new()) };
 }
 
+/// Interface offered to add a task
 pub fn add_task(task: Arc<TaskControlBlock>) {
     PID2TCB
         .exclusive_access()
@@ -37,15 +44,18 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
     TASK_MANAGER.exclusive_access().add(task);
 }
 
+/// Interface offered to pop the first task
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     TASK_MANAGER.exclusive_access().fetch()
 }
 
+/// Look up a task by pid (for sending signals)
 pub fn pid2task(pid: usize) -> Option<Arc<TaskControlBlock>> {
     let map = PID2TCB.exclusive_access();
     map.get(&pid).map(Arc::clone)
 }
 
+/// Remove a task from the pid -> TCB map (when it is reaped)
 pub fn remove_from_pid2task(pid: usize) {
     let mut map = PID2TCB.exclusive_access();
     if map.remove(&pid).is_none() {

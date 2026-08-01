@@ -53,7 +53,9 @@ pub struct BlockCache {
     cache: CacheData,
     /// underlying block id
     block_id: usize,
+    /// underlying block device
     block_device: Arc<dyn BlockDevice>,
+    /// whether the block is dirty
     modified: bool,
 }
 
@@ -122,7 +124,7 @@ impl Drop for BlockCache {
         self.sync()
     }
 }
-
+/// Use a block cache of 16 blocks
 const BLOCK_CACHE_SIZE: usize = 16;
 
 pub struct BlockCacheManager {
@@ -170,10 +172,11 @@ impl BlockCacheManager {
 }
 
 lazy_static! {
+    /// The global block cache manager
     pub static ref BLOCK_CACHE_MANAGER: Mutex<BlockCacheManager> =
         Mutex::new(BlockCacheManager::new());
 }
-
+/// Get the block cache corresponding to the given block id and block device
 pub fn get_block_cache(
     block_id: usize,
     block_device: Arc<dyn BlockDevice>,
@@ -182,7 +185,7 @@ pub fn get_block_cache(
         .lock()
         .get_block_cache(block_id, block_device)
 }
-
+/// Sync all block cache to block device
 pub fn block_cache_sync_all() {
     let manager = BLOCK_CACHE_MANAGER.lock();
     for (_, cache) in manager.queue.iter() {

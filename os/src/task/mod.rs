@@ -1,3 +1,20 @@
+//! Task management implementation
+//!
+//! Everything about task management, like starting and switching tasks is
+//! implemented here.
+//!
+//! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
+//! all the tasks in the whole operating system.
+//!
+//! A single global instance of [`Processor`] called `PROCESSOR` monitors the
+//! running task(s) for each core.
+//!
+//! A single global instance of [`PidAllocator`] called `PID_ALLOCATOR`
+//! allocates pids for user apps.
+//!
+//! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
+//! might not be what you expect.
+
 mod action;
 mod context;
 mod manager;
@@ -9,23 +26,24 @@ mod switch;
 mod task;
 
 use crate::fs::{OpenFlags, open_file};
-use crate::sbi::shutdown;
+use crate::uart::shutdown;
 use alloc::sync::Arc;
-pub use context::TaskContext;
 use lazy_static::*;
-use manager::fetch_task;
-use manager::remove_from_pid2task;
+pub use manager::{TaskManager, fetch_task, pid2task, remove_from_pid2task};
 use switch::__switch;
 use task::{TaskControlBlock, TaskStatus};
 
 pub use action::{SignalAction, SignalActions};
-pub use manager::{add_task, pid2task};
-pub use pid::{KernelStack, PidHandle, pid_alloc};
+pub use context::TaskContext;
+pub use manager::add_task;
+pub use pid::{KernelStack, PidAllocator, PidHandle, pid_alloc};
 pub use processor::{
-    current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
+    Processor, current_task, current_trap_cx, current_user_token, run_tasks, schedule,
+    take_current_task,
 };
 pub use signal::{MAX_SIG, SignalFlags};
 
+/// Suspend the current 'Running' task and run the next task in the ready queue.
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
     let task = take_current_task().unwrap();
@@ -38,17 +56,21 @@ pub fn suspend_current_and_run_next() {
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue.
+    // push back to the ready queue
     add_task(task);
-    // jump to scheduling cycle
+    // jump to the scheduling cycle
     schedule(task_cx_ptr);
 }
 
-/// pid of usertests app in make run TEST=1
+/// pid of the usertests app when `make run TEST=1` copies it to initproc
 pub const IDLE_PID: usize = 1;
 
-/// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
+/// Exit the current 'Running' task and run the next task in the ready queue.
+///
+/// The exiting task becomes a zombie; its user data pages are recycled but its
+/// kernel stack is kept alive (the trap handler is still running on it) until
+/// the parent reaps it (drops the `TaskControlBlock`).
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // take from Processor
     let task = take_current_task().unwrap();
 
@@ -59,16 +81,12 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             exit_code
         );
         if exit_code != 0 {
-            //crate::sbi::shutdown(255); //255 == -1 for err hint
             shutdown(true)
         } else {
-            //crate::sbi::shutdown(0); //0 for success hint
             shutdown(false)
         }
     }
 
-    // remove from pid2task
-    remove_from_pid2task(task.getpid());
     // **** access current TCB exclusively
     let mut inner = task.inner_exclusive_access();
     // Change status to Zombie
@@ -90,18 +108,20 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     inner.children.clear();
     // deallocate user space
     inner.memory_set.recycle_data_pages();
-    // drop file descriptors
-    inner.fd_table.clear();
     drop(inner);
     // **** release current PCB
+    // remove from the pid -> TCB map so that signals can no longer reach it
+    remove_from_pid2task(pid);
     // drop task manually to maintain rc correctly
     drop(task);
-    // we do not have to save task context
+    // we do not have to save the task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
+    panic!("unreachable in exit_current_and_run_next!");
 }
 
 lazy_static! {
+    /// The global process that init user shell
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
         let inode = open_file("initproc", OpenFlags::RDONLY).unwrap();
         let v = inode.read_all();
@@ -109,30 +129,28 @@ lazy_static! {
     });
 }
 
+/// Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
 }
 
+/// If the current task has a signal whose default action is to terminate it,
+/// return the (exit code, message) pair so the trap handler can kill it.
 pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
     let task = current_task().unwrap();
     let task_inner = task.inner_exclusive_access();
-    // println!(
-    //     "[K] check_signals_error_of_current {:?}",
-    //     task_inner.signals
-    // );
     task_inner.signals.check_error()
 }
 
+/// Add a signal to the current task's pending set.
 pub fn current_add_signal(signal: SignalFlags) {
     let task = current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
     task_inner.signals |= signal;
-    // println!(
-    //     "[K] current_add_signal:: current task sigflag {:?}",
-    //     task_inner.signals
-    // );
 }
 
+/// The kernel's own handling of the "kernel" signals: SIGSTOP freezes the
+/// task, SIGCONT unfreezes it, everything else (SIGKILL/SIGDEF) kills it.
 fn call_kernel_signal_handler(signal: SignalFlags) {
     let task = current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
@@ -148,15 +166,17 @@ fn call_kernel_signal_handler(signal: SignalFlags) {
             }
         }
         _ => {
-            // println!(
-            //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
-            //     task_inner.signals
-            // );
             task_inner.killed = true;
         }
     }
 }
 
+/// Dispatch `signal` to the user's registered handler.
+///
+/// x86-64 note: instead of the RISC-V `sepc`/`x[10]`, the trap context's `rip`
+/// is overwritten with the handler address (the `iretq` pops `RIP` from the
+/// frame) and the signal number is passed as the first SysV argument `rdi`.
+/// `sigreturn` will restore the backup context.
 fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     let task = current_task().unwrap();
     let mut task_inner = task.inner_exclusive_access();
@@ -164,22 +184,18 @@ fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
     let handler = task_inner.signal_actions.table[sig].handler;
     if handler != 0 {
         // user handler
-
-        // handle flag
         task_inner.handling_sig = sig as isize;
         task_inner.signals ^= signal;
 
-        // backup trapframe
+        // backup the current trap context
         let trap_ctx = task_inner.get_trap_cx();
         task_inner.trap_ctx_backup = Some(*trap_ctx);
 
-        // modify trapframe
-        trap_ctx.sepc = handler;
-
-        // put args (a0)
-        trap_ctx.x[10] = sig;
+        // jump to the handler on return to user mode
+        trap_ctx.rip = handler;
+        // pass the signal number as the first argument
+        trap_ctx.rdi = sig;
     } else {
-        // default action
         println!("[K] task/call_user_signal_handler: default action: ignore it or kill process");
     }
 }
@@ -214,7 +230,7 @@ fn check_pending_signals() {
                     // signal is a kernel signal
                     call_kernel_signal_handler(signal);
                 } else {
-                    // signal is a user signal
+                    // signal is a user signal: run the handler and return
                     call_user_signal_handler(sig, signal);
                     return;
                 }
@@ -223,6 +239,8 @@ fn check_pending_signals() {
     }
 }
 
+/// Called at the end of the trap handler: run any pending signal handlers. A
+/// task frozen by SIGSTOP stays suspended until SIGCONT wakes it up.
 pub fn handle_signals() {
     loop {
         check_pending_signals();

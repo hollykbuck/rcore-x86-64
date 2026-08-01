@@ -16,8 +16,8 @@ extern crate alloc;
 #[macro_use]
 extern crate bitflags;
 
-use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
+use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 use syscall::*;
 
@@ -68,9 +68,6 @@ bitflags! {
     }
 }
 
-pub fn dup(fd: usize) -> isize {
-    sys_dup(fd)
-}
 pub fn open(path: &str, flags: OpenFlags) -> isize {
     sys_open(path, flags.bits)
 }
@@ -79,6 +76,9 @@ pub fn close(fd: usize) -> isize {
 }
 pub fn pipe(pipe_fd: &mut [usize]) -> isize {
     sys_pipe(pipe_fd)
+}
+pub fn dup(fd: usize) -> isize {
+    sys_dup(fd)
 }
 pub fn read(fd: usize, buf: &mut [u8]) -> isize {
     sys_read(fd, buf)
@@ -128,14 +128,10 @@ pub fn waitpid(pid: usize, exit_code: &mut i32) -> isize {
     }
 }
 
-pub fn waitpid_nb(pid: usize, exit_code: &mut i32) -> isize {
-    sys_waitpid(pid as isize, exit_code as *mut _)
-}
-
 pub fn sleep(period_ms: usize) {
-    let start = sys_get_time();
-    while sys_get_time() < start + period_ms as isize {
-        sys_yield();
+    let start = get_time();
+    while get_time() < start + period_ms as isize {
+        yield_();
     }
 }
 
