@@ -1,31 +1,58 @@
 //! Implementation of physical and virtual address and page number.
+//!
+//! Physical memory is always accessed through the higher-half direct map
+//! (physmap): `pa + PHYS_VIRT_OFFSET == va`. Limine maps all physical memory
+//! at `hhdm_offset` while its own page tables are active, and we reproduce
+//! that mapping in every page table we install (see [`crate::mm::memory_set`]),
+//! so [`phys_to_virt()`] is valid under any active page table.
+
 use super::PageTableEntry;
 use crate::config::{PAGE_SIZE, PAGE_SIZE_BITS};
 use core::fmt::{self, Debug, Formatter};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-const PA_WIDTH_SV39: usize = 56;
-const VA_WIDTH_SV39: usize = 39;
-const PPN_WIDTH_SV39: usize = PA_WIDTH_SV39 - PAGE_SIZE_BITS;
-const VPN_WIDTH_SV39: usize = VA_WIDTH_SV39 - PAGE_SIZE_BITS;
+/// x86-64 4-level paging: 48-bit virtual addresses, 52-bit physical addresses
+const PA_WIDTH: usize = 52;
+const VA_WIDTH: usize = 48;
+const PPN_WIDTH: usize = PA_WIDTH - PAGE_SIZE_BITS;
+const VPN_WIDTH: usize = VA_WIDTH - PAGE_SIZE_BITS;
+
+/// The offset of the physmap: `phys_to_virt(pa) = pa + PHYS_VIRT_OFFSET`.
+/// Set once at boot from Limine's `hhdm_offset`, before any physical access.
+static PHYS_VIRT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+/// Cache Limine's higher-half direct map offset. Must be called before any
+/// physical memory is accessed through [`phys_to_virt()`].
+pub fn init_phys_virt_offset() {
+    PHYS_VIRT_OFFSET.store(crate::limine_reqs::hhdm_offset() as usize, Ordering::Relaxed);
+}
+
+/// Translate a physical address to a virtual one through the physmap.
+#[inline]
+pub fn phys_to_virt(pa: usize) -> usize {
+    pa + PHYS_VIRT_OFFSET.load(Ordering::Relaxed)
+}
+
+/// The virtual address of the physmap base (the offset itself).
+#[inline]
+pub fn phys_virt_offset() -> usize {
+    PHYS_VIRT_OFFSET.load(Ordering::Relaxed)
+}
 
 /// Definitions
-#[repr(C)]
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct PhysAddr(pub usize);
 
-#[repr(C)]
+/// virtual address
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
-///virtual address
 pub struct VirtAddr(pub usize);
 
-#[repr(C)]
+/// physical page number
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
-///phiscal page number
 pub struct PhysPageNum(pub usize);
 
-#[repr(C)]
+/// virtual page number
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
-///virtual page number
 pub struct VirtPageNum(pub usize);
 
 /// Debugging
@@ -57,22 +84,22 @@ impl Debug for PhysPageNum {
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PA_WIDTH_SV39) - 1))
+        Self(v & ((1 << PA_WIDTH) - 1))
     }
 }
 impl From<usize> for PhysPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << PPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << PPN_WIDTH) - 1))
     }
 }
 impl From<usize> for VirtAddr {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VA_WIDTH_SV39) - 1))
+        Self(v & ((1 << VA_WIDTH) - 1))
     }
 }
 impl From<usize> for VirtPageNum {
     fn from(v: usize) -> Self {
-        Self(v & ((1 << VPN_WIDTH_SV39) - 1))
+        Self(v & ((1 << VPN_WIDTH) - 1))
     }
 }
 impl From<PhysAddr> for usize {
@@ -87,8 +114,9 @@ impl From<PhysPageNum> for usize {
 }
 impl From<VirtAddr> for usize {
     fn from(v: VirtAddr) -> Self {
-        if v.0 >= (1 << (VA_WIDTH_SV39 - 1)) {
-            v.0 | (!((1 << VA_WIDTH_SV39) - 1))
+        // sign-extend a canonical 48-bit address to 64 bits
+        if v.0 >= (1 << (VA_WIDTH - 1)) {
+            v.0 | (!((1 << VA_WIDTH) - 1))
         } else {
             v.0
         }
@@ -99,13 +127,11 @@ impl From<VirtPageNum> for usize {
         v.0
     }
 }
-///
+
 impl VirtAddr {
-    ///`VirtAddr`->`VirtPageNum`
     pub fn floor(&self) -> VirtPageNum {
         VirtPageNum(self.0 / PAGE_SIZE)
     }
-    ///`VirtAddr`->`VirtPageNum`
     pub fn ceil(&self) -> VirtPageNum {
         if self.0 == 0 {
             VirtPageNum(0)
@@ -113,11 +139,9 @@ impl VirtAddr {
             VirtPageNum((self.0 - 1 + PAGE_SIZE) / PAGE_SIZE)
         }
     }
-    ///Get page offset
     pub fn page_offset(&self) -> usize {
         self.0 & (PAGE_SIZE - 1)
     }
-    ///Check page aligned
     pub fn aligned(&self) -> bool {
         self.page_offset() == 0
     }
@@ -134,11 +158,9 @@ impl From<VirtPageNum> for VirtAddr {
     }
 }
 impl PhysAddr {
-    ///`PhysAddr`->`PhysPageNum`
     pub fn floor(&self) -> PhysPageNum {
         PhysPageNum(self.0 / PAGE_SIZE)
     }
-    ///`PhysAddr`->`PhysPageNum`
     pub fn ceil(&self) -> PhysPageNum {
         if self.0 == 0 {
             PhysPageNum(0)
@@ -146,13 +168,19 @@ impl PhysAddr {
             PhysPageNum((self.0 - 1 + PAGE_SIZE) / PAGE_SIZE)
         }
     }
-    ///Get page offset
     pub fn page_offset(&self) -> usize {
         self.0 & (PAGE_SIZE - 1)
     }
-    ///Check page aligned
     pub fn aligned(&self) -> bool {
         self.page_offset() == 0
+    }
+    /// Get a reference through the physmap window (`pa + hhdm_offset`).
+    pub fn get_ref<T>(&self) -> &'static T {
+        unsafe { (phys_to_virt(self.0) as *const T).as_ref().unwrap() }
+    }
+    /// Get a mutable reference through the physmap window (`pa + hhdm_offset`).
+    pub fn get_mut<T>(&self) -> &'static mut T {
+        unsafe { (phys_to_virt(self.0) as *mut T).as_mut().unwrap() }
     }
 }
 impl From<PhysAddr> for PhysPageNum {
@@ -168,11 +196,12 @@ impl From<PhysPageNum> for PhysAddr {
 }
 
 impl VirtPageNum {
-    ///Return VPN 3 level index
-    pub fn indexes(&self) -> [usize; 3] {
+    /// The four page-table indexes for a virtual page number, from the PML4
+    /// down to the page-table level.
+    pub fn indexes(&self) -> [usize; 4] {
         let mut vpn = self.0;
-        let mut idx = [0usize; 3];
-        for i in (0..3).rev() {
+        let mut idx = [0usize; 4];
+        for i in (0..4).rev() {
             idx[i] = vpn & 511;
             vpn >>= 9;
         }
@@ -180,36 +209,24 @@ impl VirtPageNum {
     }
 }
 
-impl PhysAddr {
-    ///Get reference to `PhysAddr` value
-    pub fn get_ref<T>(&self) -> &'static T {
-        unsafe { (self.0 as *const T).as_ref().unwrap() }
-    }
-    ///Get mutable reference to `PhysAddr` value
-    pub fn get_mut<T>(&self) -> &'static mut T {
-        unsafe { (self.0 as *mut T).as_mut().unwrap() }
-    }
-}
 impl PhysPageNum {
-    ///Get `PageTableEntry` on `PhysPageNum`
+    /// The 512 PTEs of the page table frame at this page number. Physical
+    /// access goes through the physmap.
     pub fn get_pte_array(&self) -> &'static mut [PageTableEntry] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut PageTableEntry, 512) }
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut PageTableEntry, 512) }
     }
-    ///Get u8 array on `PhysPageNum`
     pub fn get_bytes_array(&self) -> &'static mut [u8] {
         let pa: PhysAddr = (*self).into();
-        unsafe { core::slice::from_raw_parts_mut(pa.0 as *mut u8, 4096) }
+        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(pa.0) as *mut u8, 4096) }
     }
-    ///Get Get mutable reference to `PhysAddr` value on `PhysPageNum`
     pub fn get_mut<T>(&self) -> &'static mut T {
         let pa: PhysAddr = (*self).into();
-        pa.get_mut()
+        unsafe { (phys_to_virt(pa.0) as *mut T).as_mut().unwrap() }
     }
 }
-///Add value by one
+
 pub trait StepByOne {
-    ///Add value by one
     fn step(&mut self);
 }
 impl StepByOne for VirtPageNum {
@@ -288,5 +305,6 @@ where
         }
     }
 }
+
 /// a simple range structure for virtual page number
 pub type VPNRange = SimpleRange<VirtPageNum>;

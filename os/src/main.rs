@@ -6,23 +6,24 @@
 //! - [`trap`]: Handles all cases of switching from userspace to the kernel
 //! - [`task`]: Task management
 //! - [`syscall`]: System call handling and implementation
-//! - [`mm`]: Address map using SV39
-//! - [`sync`]: Wrap a static data structure inside it so that we are able to access it without any `unsafe`.
-//! - [`fs`]: Separate user from file system with some structures
 //!
 //! The operating system also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
-//! initialize various pieces of functionality. (See its source code for
-//! details.)
+//! executing from `_start` (defined in `limine_reqs.rs`), after which
+//! [`rust_main()`] is called to initialize various pieces of functionality.
+//! (See its source code for details.)
 //!
-//! We then call [`task::run_tasks()`] and for the first time go to
-//! userspace.
+//! We then call [`task::add_initproc()`] and let the scheduler
+//! ([`task::run_tasks()`]) bring up the init process and everything after it.
 
 #![deny(missing_docs)]
 #![deny(warnings)]
-#![allow(unused_imports)]
 #![no_std]
 #![no_main]
+
+extern crate alloc;
+
+#[macro_use]
+extern crate bitflags;
 
 macro_rules! linker_symbol_addr {
     ($symbol:path) => {
@@ -30,35 +31,23 @@ macro_rules! linker_symbol_addr {
     };
 }
 
-extern crate alloc;
-
-#[macro_use]
-extern crate bitflags;
-
 use log::*;
-
-#[path = "boards/qemu.rs"]
-mod board;
-
 #[macro_use]
 mod console;
 mod config;
-mod device_tree;
 mod drivers;
 pub mod fs;
-pub mod lang_items;
+mod lang_items;
+mod limine_reqs;
 mod logging;
-pub mod mm;
-pub mod sbi;
-pub mod sync;
+mod mm;
+mod sync;
 pub mod syscall;
 pub mod task;
-pub mod timer;
+mod timer;
 pub mod trap;
+mod uart;
 
-use core::arch::global_asm;
-
-global_asm!(include_str!("entry.asm"));
 /// clear BSS segment
 fn clear_bss() {
     unsafe extern "C" {
@@ -76,18 +65,19 @@ fn clear_bss() {
 
 /// the rust entry-point of os
 #[unsafe(no_mangle)]
-pub fn rust_main(_hart_id: usize, dtb_pa: usize) -> ! {
+pub fn rust_main() -> ! {
+    uart::init();
     clear_bss();
     logging::init();
-    device_tree::init(dtb_pa);
-    info!("[kernel] Hello, world!");
+
+    println!("[kernel] Hello, world!");
+
+    info!("[kernel] Initializing memory management ...");
     mm::init();
-    mm::remap_test();
     trap::init();
+    timer::init();
     trap::enable_timer_interrupt();
-    timer::set_next_trigger();
     fs::list_apps();
     task::add_initproc();
-    task::run_tasks();
-    panic!("Unreachable in rust_main!");
+    task::run_tasks()
 }
