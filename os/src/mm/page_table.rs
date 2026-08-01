@@ -1,21 +1,23 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
+//!
+//! x86-64 4-level paging: PML4 -> PDPT -> PD -> PT. The top-level page
+//! table is pointed to by CR3, whose value is a physical address. Only 4KiB
+//! pages are used in this chapter.
 
-use super::{FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
-use alloc::string::String;
+use super::{FrameTracker, PhysPageNum, VirtAddr, VirtPageNum, frame_alloc};
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::arch::asm;
 
 bitflags! {
-    pub struct PTEFlags: u8 {
-        const V = 1 << 0;
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        const G = 1 << 5;
-        const A = 1 << 6;
-        const D = 1 << 7;
+    /// page table entry flags, x86-64 encoding
+    pub struct PTEFlags: u64 {
+        const V = 1 << 0;   // present
+        const W = 1 << 1;   // writable
+        const U = 1 << 2;   // user accessible
+        const PS = 1 << 7;  // page size (2MiB/1GiB)
+        const NX = 1 << 63; // not executable (honored iff EFER.NXE is set)
     }
 }
 
@@ -23,47 +25,42 @@ bitflags! {
 #[repr(C)]
 /// page table entry structure
 pub struct PageTableEntry {
-    ///PTE
-    pub bits: usize,
+    pub bits: u64,
 }
 
+/// physical address bits of a page table entry
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
 impl PageTableEntry {
-    ///Create a PTE from ppn
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: (ppn.0 as u64) << 12 | flags.bits,
         }
     }
-    ///Return an empty PTE
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
     }
-    ///Return 44bit ppn
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        PhysPageNum(((self.bits & PTE_ADDR_MASK) >> 12) as usize)
     }
-    ///Return 10bit flag
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        // the address bits (12..52) are not part of the flag bitflags, so
+        // they must be dropped before decoding (unlike SV39 where the flags
+        // live in a byte of their own)
+        PTEFlags::from_bits_truncate(self.bits)
     }
-    ///Check PTE valid
     pub fn is_valid(&self) -> bool {
         (self.flags() & PTEFlags::V) != PTEFlags::empty()
     }
-    ///Check PTE readable
-    pub fn readable(&self) -> bool {
-        (self.flags() & PTEFlags::R) != PTEFlags::empty()
-    }
-    ///Check PTE writable
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
     }
-    ///Check PTE executable
     pub fn executable(&self) -> bool {
-        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+        (self.flags() & PTEFlags::NX) == PTEFlags::empty()
     }
 }
 
+/// page table structure
 pub struct PageTable {
     root_ppn: PhysPageNum,
     frames: Vec<FrameTracker>,
@@ -78,12 +75,9 @@ impl PageTable {
             frames: vec![frame],
         }
     }
-    /// Temporarily used to get arguments from user space.
-    pub fn from_token(satp: usize) -> Self {
-        Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
-            frames: Vec::new(),
-        }
+    /// The value to load into CR3: the physical address of the PML4.
+    pub fn root_ppn(&self) -> PhysPageNum {
+        self.root_ppn
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
@@ -91,13 +85,17 @@ impl PageTable {
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
+            if i == 3 {
                 result = Some(pte);
                 break;
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().unwrap();
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                // intermediate entries must allow user access and writes:
+                // on x86 the W and U bits are checked at *every* level of the
+                // walk (unlike SV39, which only checks the leaf), so V|W|U is
+                // required for both kernel writes and ring-3 accesses
+                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V | PTEFlags::W | PTEFlags::U);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
@@ -110,7 +108,7 @@ impl PageTable {
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
+            if i == 3 {
                 result = Some(pte);
                 break;
             }
@@ -132,73 +130,21 @@ impl PageTable {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+        // The TLB may still cache the old mapping of this page in the current
+        // address space; there is no `sfence.vma` on x86, so invalidate the
+        // single page explicitly. (Without this, a just-freed sbrk page keeps
+        // being accessible.)
+        let va: VirtAddr = vpn.into();
+        unsafe {
+            asm!("invlpg [{0}]", in(reg) usize::from(va), options(nostack));
+        }
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
-    pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
-            //println!("translate_va:va = {:?}", va);
-            let aligned_pa: PhysAddr = pte.ppn().into();
-            //println!("translate_va:pa_align = {:?}", aligned_pa);
-            let offset = va.page_offset();
-            let aligned_pa_usize: usize = aligned_pa.into();
-            (aligned_pa_usize + offset).into()
-        })
-    }
+    /// The value to write into CR3: the **physical address** of the PML4
+    /// (`PhysPageNum` is a frame index, CR3 wants an address).
     pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+        self.root_ppn.0 << 12
     }
-}
-/// translate a pointer to a mutable u8 Vec through page table
-pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
-    let page_table = PageTable::from_token(token);
-    let mut start = ptr as usize;
-    let end = start + len;
-    let mut v = Vec::new();
-    while start < end {
-        let start_va = VirtAddr::from(start);
-        let mut vpn = start_va.floor();
-        let ppn = page_table.translate(vpn).unwrap().ppn();
-        vpn.step();
-        let mut end_va: VirtAddr = vpn.into();
-        end_va = end_va.min(VirtAddr::from(end));
-        if end_va.page_offset() == 0 {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
-        } else {
-            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
-        }
-        start = end_va.into();
-    }
-    v
-}
-/// translate a pointer to a mutable u8 Vec end with `\0` through page table to a `String`
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
-    let page_table = PageTable::from_token(token);
-    let mut string = String::new();
-    let mut va = ptr as usize;
-    loop {
-        let ch: u8 = *(page_table
-            .translate_va(VirtAddr::from(va))
-            .unwrap()
-            .get_mut());
-        if ch == 0 {
-            break;
-        } else {
-            string.push(ch as char);
-            va += 1;
-        }
-    }
-    string
-}
-///translate a generic through page table and return a mutable reference
-pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
-    //println!("into translated_refmut!");
-    let page_table = PageTable::from_token(token);
-    let va = ptr as usize;
-    //println!("translated_refmut: before translate_va");
-    page_table
-        .translate_va(VirtAddr::from(va))
-        .unwrap()
-        .get_mut()
 }

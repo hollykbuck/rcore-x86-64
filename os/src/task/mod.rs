@@ -6,14 +6,15 @@
 //! A single global instance of [`TaskManager`] called `TASK_MANAGER` controls
 //! all the tasks in the whole operating system.
 //!
-//! A single global instance of [`Processor`] called `PROCESSOR` monitors running
-//! task(s) for each core.
+//! A single global instance of [`Processor`] called `PROCESSOR` monitors the
+//! running task(s) for each core.
 //!
-//! A single global instance of [`PidAllocator`] called `PID_ALLOCATOR` allocates
-//! pid for user apps.
+//! A single global instance of [`PidAllocator`] called `PID_ALLOCATOR`
+//! allocates pids for user apps.
 //!
 //! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
+
 mod context;
 mod manager;
 mod pid;
@@ -23,7 +24,7 @@ mod switch;
 mod task;
 
 use crate::loader::get_app_data_by_name;
-use crate::sbi::shutdown;
+use crate::uart::shutdown;
 use alloc::sync::Arc;
 use lazy_static::*;
 pub use manager::{TaskManager, fetch_task};
@@ -37,7 +38,8 @@ pub use processor::{
     Processor, current_task, current_trap_cx, current_user_token, run_tasks, schedule,
     take_current_task,
 };
-/// Suspend the current 'Running' task and run the next task in task list.
+
+/// Suspend the current 'Running' task and run the next task in the ready queue.
 pub fn suspend_current_and_run_next() {
     // There must be an application running.
     let task = take_current_task().unwrap();
@@ -50,17 +52,21 @@ pub fn suspend_current_and_run_next() {
     drop(task_inner);
     // ---- release current PCB
 
-    // push back to ready queue.
+    // push back to the ready queue
     add_task(task);
-    // jump to scheduling cycle
+    // jump to the scheduling cycle
     schedule(task_cx_ptr);
 }
 
-/// pid of usertests app in make run TEST=1
+/// pid of the usertests app when `make run TEST=1` copies it to initproc
 pub const IDLE_PID: usize = 1;
 
-/// Exit the current 'Running' task and run the next task in task list.
-pub fn exit_current_and_run_next(exit_code: i32) {
+/// Exit the current 'Running' task and run the next task in the ready queue.
+///
+/// The exiting task becomes a zombie; its user data pages are recycled but its
+/// kernel stack is kept alive (the trap handler is still running on it) until
+/// the parent reaps it (drops the `TaskControlBlock`).
+pub fn exit_current_and_run_next(exit_code: i32) -> ! {
     // take from Processor
     let task = take_current_task().unwrap();
 
@@ -71,10 +77,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             exit_code
         );
         if exit_code != 0 {
-            //crate::sbi::shutdown(255); //255 == -1 for err hint
             shutdown(true)
         } else {
-            //crate::sbi::shutdown(0); //0 for success hint
             shutdown(false)
         }
     }
@@ -104,18 +108,20 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // **** release current PCB
     // drop task manually to maintain rc correctly
     drop(task);
-    // we do not have to save task context
+    // we do not have to save the task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
+    panic!("unreachable in exit_current_and_run_next!");
 }
 
 lazy_static! {
-    ///Globle process that init user shell
+    /// The global process that init user shell
     pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new(TaskControlBlock::new(
         get_app_data_by_name("initproc").unwrap()
     ));
 }
-///Add init process to the manager
+
+/// Add init process to the manager
 pub fn add_initproc() {
     add_task(INITPROC.clone());
 }

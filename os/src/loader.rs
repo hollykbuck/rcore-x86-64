@@ -1,16 +1,21 @@
 //! Loading user applications into memory
+//!
+//! The apps are linked into the kernel image as full ELF files. The kernel
+//! parses the ELF program headers itself; per-process kernel stacks are no
+//! longer a fixed array in `.bss` (see `crate::task::pid::KernelStack`).
 
-/// Get the total number of applications.
 use alloc::vec::Vec;
 use lazy_static::*;
-///get app number
+
+/// Get the total number of applications.
 pub fn get_num_app() -> usize {
     unsafe extern "C" {
         safe fn _num_app();
     }
     unsafe { (linker_symbol_addr!(_num_app) as *const usize).read_volatile() }
 }
-/// get applications data
+
+/// Get the ELF image of application `app_id`.
 pub fn get_app_data(app_id: usize) -> &'static [u8] {
     unsafe extern "C" {
         safe fn _num_app();
@@ -28,7 +33,7 @@ pub fn get_app_data(app_id: usize) -> &'static [u8] {
 }
 
 lazy_static! {
-    ///All of app's name
+    /// All the app names, in the same order as `_num_app`.
     static ref APP_NAMES: Vec<&'static str> = {
         let num_app = get_num_app();
         unsafe extern "C" {
@@ -52,19 +57,10 @@ lazy_static! {
     };
 }
 
-#[allow(unused)]
-///get app data from name
+/// Get the ELF image of the application named `name`, if it exists.
 pub fn get_app_data_by_name(name: &str) -> Option<&'static [u8]> {
     let num_app = get_num_app();
     (0..num_app)
-        .find(|&i| APP_NAMES[i] == name)
+        .find(|i| APP_NAMES[*i] == name)
         .map(get_app_data)
-}
-///list all apps
-pub fn list_apps() {
-    println!("/**** APPS ****");
-    for app in APP_NAMES.iter() {
-        println!("{}", app);
-    }
-    println!("**************/");
 }
