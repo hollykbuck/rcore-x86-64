@@ -2,17 +2,18 @@
 
 pub const USER_STACK_SIZE: usize = 4096 * 2;
 pub const KERNEL_STACK_SIZE: usize = 4096 * 2;
+/// Maximum number of applications. The per-task kernel stacks live in the
+/// kernel `.bss` (shared by every page table), so this is a compile-time
+/// bound; the actual number of apps is given by `_num_app`.
+pub const MAX_APP_NUM: usize = 16;
 pub const KERNEL_HEAP_SIZE: usize = 0x30_0000;
 pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 
-pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
-pub const TRAP_CONTEXT: usize = TRAMPOLINE - PAGE_SIZE;
-/// Return (bottom, top) of a kernel stack in kernel space.
-pub fn kernel_stack_position(app_id: usize) -> (usize, usize) {
-    let top = TRAMPOLINE - app_id * (KERNEL_STACK_SIZE + PAGE_SIZE);
-    let bottom = top - KERNEL_STACK_SIZE;
-    (bottom, top)
-}
-
-pub use crate::board::{MEMORY_END, MMIO};
+/// The virtual address where the kernel image is linked
+pub const KERNEL_BASE: usize = 0xffffffff80000000;
+/// Fallback physical memory size (QEMU `-m 256M`), used if the Limine memory
+/// map reports no usable region.
+pub const MEMORY_END: usize = 0x1000_0000;
+/// The physical base of the local APIC MMIO window
+pub const LAPIC_BASE: usize = 0xFEE0_0000;

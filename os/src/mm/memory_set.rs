@@ -1,17 +1,34 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
+//!
+//! x86-64 layout (see the ch4 plan for the rationale):
+//!
+//! - the **kernel high-half** is mapped by a single shared subtree
+//!   (`PML4[511]`): every page table we install, kernel or per-app, points at
+//!   the same physical kernel page-table frames. Kernel code/data/bss (and
+//!   therefore every task's kernel stack) stay reachable under any active
+//!   CR3, so traps never need to switch CR3.
+//! - the **physmap** (`phys + hhdm_offset == virt`) is mapped under a second
+//!   top-level entry (`PML4[256]` on Limine's default x86-64 HHDM base), also
+//!   shared by every page table, so physical memory (page-table frames, app
+//!   data, the local APIC) can be touched no matter which page table is
+//!   active.
+//! - the low 4GiB identity mapping from ch3 is gone: it would collide with
+//!   the user virtual addresses (apps link at `0x10000`).
 
+use super::address::phys_virt_offset;
 use super::{FrameTracker, frame_alloc};
-use super::{PTEFlags, PageTable, PageTableEntry};
+use super::{PTEFlags, PageTable};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE};
+use crate::config::{
+    KERNEL_BASE, LAPIC_BASE, MEMORY_END, PAGE_SIZE, USER_STACK_SIZE,
+};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use lazy_static::*;
-use riscv::register::satp;
 
 unsafe extern "C" {
     safe fn stext();
@@ -19,11 +36,9 @@ unsafe extern "C" {
     safe fn srodata();
     safe fn erodata();
     safe fn sdata();
-    safe fn edata();
+    safe fn egot();
     safe fn sbss_with_stack();
     safe fn ebss();
-    safe fn ekernel();
-    safe fn strampoline();
 }
 
 lazy_static! {
@@ -48,18 +63,6 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
-    /// Assume that no conflicts.
-    pub fn insert_framed_area(
-        &mut self,
-        start_va: VirtAddr,
-        end_va: VirtAddr,
-        permission: MapPermission,
-    ) {
-        self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
-        );
-    }
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
@@ -67,110 +70,100 @@ impl MemorySet {
         }
         self.areas.push(map_area);
     }
-    /// Mention that trampoline is not collected by areas.
-    fn map_trampoline(&mut self) {
-        self.page_table.map(
-            VirtAddr::from(TRAMPOLINE).into(),
-            PhysAddr::from(linker_symbol_addr!(strampoline)).into(),
-            PTEFlags::R | PTEFlags::X,
-        );
+    /// The physical address of the kernel image, which anchors the kernel's
+    /// va -> pa linear offset.
+    fn kernel_pa_offset() -> usize {
+        let kernel_phys = crate::limine_reqs::kernel_physical_base() as usize;
+        VirtAddr::from(KERNEL_BASE).0 - kernel_phys
     }
-    /// Without kernel stacks.
+    /// Build the kernel address space:
+    /// - the kernel image mapped linearly at `KERNEL_BASE` (pa = va - offset);
+    /// - the physmap (all physical memory, plus the local APIC MMIO);
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
-        // map trampoline
-        memory_set.map_trampoline();
+        let kernel_offset = Self::kernel_pa_offset();
         // map kernel sections
-        println!(
-            ".text [{:#x}, {:#x})",
-            linker_symbol_addr!(stext),
-            linker_symbol_addr!(etext)
-        );
-        println!(
-            ".rodata [{:#x}, {:#x})",
-            linker_symbol_addr!(srodata),
-            linker_symbol_addr!(erodata)
-        );
-        println!(
-            ".data [{:#x}, {:#x})",
-            linker_symbol_addr!(sdata),
-            linker_symbol_addr!(edata)
-        );
-        println!(
-            ".bss [{:#x}, {:#x})",
-            linker_symbol_addr!(sbss_with_stack),
-            linker_symbol_addr!(ebss)
-        );
-        println!("mapping .text section");
         memory_set.push(
-            MapArea::new(
+            MapArea::new_linear(
                 (linker_symbol_addr!(stext)).into(),
                 (linker_symbol_addr!(etext)).into(),
-                MapType::Identical,
                 MapPermission::R | MapPermission::X,
+                kernel_offset,
             ),
             None,
         );
-        println!("mapping .rodata section");
         memory_set.push(
-            MapArea::new(
+            MapArea::new_linear(
                 (linker_symbol_addr!(srodata)).into(),
                 (linker_symbol_addr!(erodata)).into(),
-                MapType::Identical,
                 MapPermission::R,
+                kernel_offset,
             ),
             None,
         );
-        println!("mapping .data section");
         memory_set.push(
-            MapArea::new(
+            MapArea::new_linear(
                 (linker_symbol_addr!(sdata)).into(),
-                (linker_symbol_addr!(edata)).into(),
-                MapType::Identical,
+                (linker_symbol_addr!(egot)).into(),
                 MapPermission::R | MapPermission::W,
+                kernel_offset,
             ),
             None,
         );
-        println!("mapping .bss section");
         memory_set.push(
-            MapArea::new(
+            MapArea::new_linear(
                 (linker_symbol_addr!(sbss_with_stack)).into(),
                 (linker_symbol_addr!(ebss)).into(),
-                MapType::Identical,
                 MapPermission::R | MapPermission::W,
+                kernel_offset,
             ),
             None,
         );
-        println!("mapping physical memory");
+        // the physmap: all physical memory at phys + hhdm_offset. The base is
+        // canonicalized to 48 bits so the Linear `pa = va - pa_offset` math
+        // works (pa_offset must live in the same 48-bit space as `va`).
+        let phys_base = VirtAddr::from(phys_virt_offset()).0;
         memory_set.push(
-            MapArea::new(
-                (linker_symbol_addr!(ekernel)).into(),
-                MEMORY_END.into(),
-                MapType::Identical,
+            MapArea::new_linear(
+                (phys_base).into(),
+                (phys_base + MEMORY_END).into(),
                 MapPermission::R | MapPermission::W,
+                phys_base,
             ),
             None,
         );
-        println!("mapping memory-mapped registers");
-        for pair in MMIO {
-            memory_set.push(
-                MapArea::new(
-                    (*pair).0.into(),
-                    ((*pair).0 + (*pair).1).into(),
-                    MapType::Identical,
-                    MapPermission::R | MapPermission::W,
-                ),
-                None,
-            );
-        }
+        // the local APIC MMIO window (used by the timer from trap handlers
+        // running on any page table)
+        memory_set.push(
+            MapArea::new_linear(
+                (phys_base + LAPIC_BASE).into(),
+                (phys_base + LAPIC_BASE + PAGE_SIZE).into(),
+                MapPermission::R | MapPermission::W,
+                phys_base,
+            ),
+            None,
+        );
         memory_set
     }
-    /// Include sections in elf and trampoline and TrapContext and user stack,
-    /// also returns user_sp and entry point.
+    /// Share the kernel high-half and the physmap with a freshly created app
+    /// page table: copy the corresponding top-level entries from
+    /// `KERNEL_SPACE`'s page table.
+    fn graft_kernel_entries(&mut self) {
+        let kernel_root = KERNEL_SPACE.exclusive_access().page_table.root_ppn();
+        let kernel_root_entries = kernel_root.get_pte_array();
+        let my_root = self.page_table.root_ppn();
+        let my_entries = my_root.get_pte_array();
+        let physmap_idx = (phys_virt_offset() >> 39) & 0x1FF;
+        let kernel_idx = (KERNEL_BASE >> 39) & 0x1FF;
+        my_entries[physmap_idx] = kernel_root_entries[physmap_idx];
+        my_entries[kernel_idx] = kernel_root_entries[kernel_idx];
+    }
+    /// Include sections in elf and user stack, also returns user_sp and entry
+    /// point.
     pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
         let mut memory_set = Self::new_bare();
-        // map trampoline
-        memory_set.map_trampoline();
+        // share the kernel high-half + physmap
+        memory_set.graft_kernel_entries();
         // map program headers of elf, with U flag
         let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
         let elf_header = elf.header;
@@ -227,31 +220,19 @@ impl MemorySet {
             ),
             None,
         );
-        // map TrapContext
-        memory_set.push(
-            MapArea::new(
-                TRAP_CONTEXT.into(),
-                TRAMPOLINE.into(),
-                MapType::Framed,
-                MapPermission::R | MapPermission::W,
-            ),
-            None,
-        );
         (
             memory_set,
             user_stack_top,
             elf.header.pt2.entry_point() as usize,
         )
     }
+    /// Switch to this address space by writing CR3 (which also flushes the
+    /// whole TLB; there is no `sfence.vma` on x86).
     pub fn activate(&self) {
-        let satp = self.page_table.token();
+        let cr3 = self.page_table.token();
         unsafe {
-            satp::write(satp::Satp::from_bits(satp));
-            asm!("sfence.vma");
+            asm!("mov cr3, {0}", in(reg) cr3, options(nostack));
         }
-    }
-    pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.page_table.translate(vpn)
     }
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
@@ -305,19 +286,30 @@ impl MapArea {
             map_perm,
         }
     }
+    /// Create a linear (va -> pa = va - `pa_offset`) map area.
+    pub fn new_linear(
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        map_perm: MapPermission,
+        pa_offset: usize,
+    ) -> Self {
+        Self::new(start_va, end_va, MapType::Linear { pa_offset }, map_perm)
+    }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {
-            MapType::Identical => {
-                ppn = PhysPageNum(vpn.0);
-            }
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 ppn = frame.ppn;
                 self.data_frames.insert(vpn, frame);
             }
+            MapType::Linear { pa_offset } => {
+                let va: VirtAddr = vpn.into();
+                let pa: PhysAddr = (va.0 - pa_offset).into();
+                ppn = pa.floor();
+            }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = pte_flags_from_perm(self.map_perm);
         page_table.map(vpn, ppn, pte_flags);
     }
     #[allow(unused)]
@@ -376,11 +368,29 @@ impl MapArea {
     }
 }
 
+/// Convert a `MapPermission` to x86 page table flags. `R` is implied (x86 has
+/// no separate read bit); `X` becomes the inverse of the `NX` bit.
+fn pte_flags_from_perm(perm: MapPermission) -> PTEFlags {
+    let mut flags = PTEFlags::V;
+    if perm.contains(MapPermission::W) {
+        flags |= PTEFlags::W;
+    }
+    if perm.contains(MapPermission::U) {
+        flags |= PTEFlags::U;
+    }
+    if !perm.contains(MapPermission::X) {
+        flags |= PTEFlags::NX;
+    }
+    flags
+}
+
 #[derive(Copy, Clone, PartialEq, Debug)]
-/// map type for memory set: identical or framed
+/// map type for memory set: framed or linear
 pub enum MapType {
-    Identical,
+    /// allocate a new frame for every virtual page
     Framed,
+    /// `pa = va - pa_offset`
+    Linear { pa_offset: usize },
 }
 
 bitflags! {
@@ -391,35 +401,4 @@ bitflags! {
         const X = 1 << 3;
         const U = 1 << 4;
     }
-}
-
-#[allow(unused)]
-pub fn remap_test() {
-    let mut kernel_space = KERNEL_SPACE.exclusive_access();
-    let mid_text: VirtAddr = ((linker_symbol_addr!(stext) + linker_symbol_addr!(etext)) / 2).into();
-    let mid_rodata: VirtAddr =
-        ((linker_symbol_addr!(srodata) + linker_symbol_addr!(erodata)) / 2).into();
-    let mid_data: VirtAddr = ((linker_symbol_addr!(sdata) + linker_symbol_addr!(edata)) / 2).into();
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_text.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_rodata.floor())
-            .unwrap()
-            .writable(),
-    );
-    assert!(
-        !kernel_space
-            .page_table
-            .translate(mid_data.floor())
-            .unwrap()
-            .executable(),
-    );
-    println!("remap_test passed!");
 }

@@ -14,10 +14,10 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::loader::{get_app_data, get_num_app};
-use crate::sbi::shutdown;
+use crate::loader::{get_app_data, get_num_app, kernel_stack_top};
 use crate::sync::UPSafeCell;
-use crate::trap::TrapContext;
+use crate::trap::{TrapContext, set_current_stack_top};
+use crate::uart::shutdown;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -52,9 +52,8 @@ struct TaskManagerInner {
 lazy_static! {
     /// a `TaskManager` global instance through lazy_static!
     pub static ref TASK_MANAGER: TaskManager = {
-        println!("init TASK_MANAGER");
         let num_app = get_num_app();
-        println!("num_app = {}", num_app);
+        assert!(num_app <= crate::config::MAX_APP_NUM);
         let mut tasks: Vec<TaskControlBlock> = Vec::new();
         for i in 0..num_app {
             tasks.push(TaskControlBlock::new(get_app_data(i), i));
@@ -78,9 +77,14 @@ impl TaskManager {
     /// But in ch4, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
-        let next_task = &mut inner.tasks[0];
-        next_task.task_status = TaskStatus::Running;
-        let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
+        let task0 = &mut inner.tasks[0];
+        task0.task_status = TaskStatus::Running;
+        let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+        // x86-64: switch the kernel stack and the address space to task 0
+        // before jumping into it, so `__restore` -> `iretq` runs under task
+        // 0's own page table.
+        set_current_stack_top(kernel_stack_top(0) as u64);
+        task0.memory_set.activate();
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -144,6 +148,11 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            // x86-64: switch kernel stack + address space to the next task
+            // before `__switch`; both page tables share the kernel high-half
+            // and the physmap, so the switch itself is safe.
+            set_current_stack_top(kernel_stack_top(next) as u64);
+            inner.tasks[next].memory_set.activate();
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {

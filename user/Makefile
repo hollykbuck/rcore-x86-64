@@ -1,23 +1,21 @@
-TARGET := riscv64gc-unknown-none-elf
+TARGET := x86_64-unknown-none
 MODE := release
 APP_DIR := src/bin
 TARGET_DIR := target/$(TARGET)/$(MODE)
 APPS := $(wildcard $(APP_DIR)/*.rs)
 ELFS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%, $(APPS))
-BINS := $(patsubst $(APP_DIR)/%.rs, $(TARGET_DIR)/%.bin, $(APPS))
 
-OBJDUMP := rust-objdump --arch-name=riscv64
-OBJCOPY := rust-objcopy --binary-architecture=riscv64
+OBJDUMP := rust-objdump
 
-elf: $(APPS)
+# ch4: every app is an independent ELF linked at the same base address
+# (BASE_ADDRESS in src/linker.ld); the kernel parses the ELF program headers
+# itself, so no per-app relocation and no `.bin` blobs are needed.
+build: $(APPS)
 	@cargo build --release
 
-binary: elf
-	@$(foreach elf, $(ELFS), $(OBJCOPY) $(elf) --strip-all -O binary $(patsubst $(TARGET_DIR)/%, $(TARGET_DIR)/%.bin, $(elf));)
-
-build: binary
+elf: build
 
 clean:
 	@cargo clean
 
-.PHONY: elf binary build clean
+.PHONY: build elf clean

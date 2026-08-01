@@ -8,9 +8,9 @@
 //! - [`syscall`]: System call handling and implementation
 //!
 //! The operating system also starts in this module. Kernel code starts
-//! executing from `entry.asm`, after which [`rust_main()`] is called to
-//! initialize various pieces of functionality. (See its source code for
-//! details.)
+//! executing from `_start` (defined in `limine_reqs.rs`), after which
+//! [`rust_main()`] is called to initialize various pieces of functionality.
+//! (See its source code for details.)
 //!
 //! We then call [`task::run_first_task()`] and for the first time go to
 //! userspace.
@@ -20,39 +20,36 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+#[macro_use]
+extern crate bitflags;
+
 macro_rules! linker_symbol_addr {
     ($symbol:path) => {
         ($symbol as *const ()).addr()
     };
 }
 
-extern crate alloc;
-
-#[macro_use]
-extern crate bitflags;
+use core::arch::global_asm;
 
 use log::*;
-
-#[path = "boards/qemu.rs"]
-mod board;
-
 #[macro_use]
 mod console;
 mod config;
-mod device_tree;
 mod lang_items;
+mod limine_reqs;
 mod loader;
 mod logging;
 mod mm;
-mod sbi;
 mod sync;
 pub mod syscall;
 pub mod task;
 mod timer;
 pub mod trap;
+mod uart;
 
-core::arch::global_asm!(include_str!("entry.asm"));
-core::arch::global_asm!(include_str!("link_app.S"));
+global_asm!(include_str!("link_app.S"));
 
 /// clear BSS segment
 fn clear_bss() {
@@ -71,18 +68,18 @@ fn clear_bss() {
 
 /// the rust entry-point of os
 #[unsafe(no_mangle)]
-pub fn rust_main(_hart_id: usize, dtb_pa: usize) -> ! {
+pub fn rust_main() -> ! {
+    uart::init();
     clear_bss();
     logging::init();
-    device_tree::init(dtb_pa);
-    info!("[kernel] Hello, world!");
+
+    println!("[kernel] Hello, world!");
+
+    info!("[kernel] Initializing memory management ...");
     mm::init();
-    info!("[kernel] back to world!");
-    mm::remap_test();
     trap::init();
-    //trap::enable_interrupt();
+    timer::init();
     trap::enable_timer_interrupt();
-    timer::set_next_trigger();
     task::run_first_task();
     panic!("Unreachable in rust_main!");
 }

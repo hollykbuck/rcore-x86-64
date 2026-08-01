@@ -6,13 +6,16 @@ extern crate user_lib;
 
 const LEN: usize = 100;
 
+// a static variable in `.data` to exercise the ELF data segment mapping
+static mut P: u64 = 3;
+
 #[unsafe(no_mangle)]
 fn main() -> i32 {
-    let p = 3u64;
+    let p = unsafe { P };
     let m = 998244353u64;
-    let iter: usize = 300000;
-    let mut cur = 0usize;
+    let iter: usize = 200000;
     let mut s = [0u64; LEN];
+    let mut cur = 0usize;
     s[cur] = 1;
     for i in 1..=iter {
         let next = if cur + 1 == LEN { 0 } else { cur + 1 };

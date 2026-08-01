@@ -1,5 +1,11 @@
 #![no_std]
 
+macro_rules! linker_symbol_addr {
+    ($symbol:path) => {
+        ($symbol as *const ()).addr()
+    };
+}
+
 #[macro_use]
 pub mod console;
 mod lang_items;
@@ -12,10 +18,21 @@ unsafe extern "Rust" {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 pub extern "C" fn _start() -> ! {
+    clear_bss();
     unsafe {
         exit(main());
     }
     panic!("unreachable after sys_exit!");
+}
+
+fn clear_bss() {
+    unsafe extern "C" {
+        safe fn start_bss();
+        safe fn end_bss();
+    }
+    (linker_symbol_addr!(start_bss)..linker_symbol_addr!(end_bss)).for_each(|addr| unsafe {
+        (addr as *mut u8).write_volatile(0);
+    });
 }
 
 use syscall::*;

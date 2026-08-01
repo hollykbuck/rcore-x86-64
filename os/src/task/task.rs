@@ -1,15 +1,17 @@
 //! Types related to task management
 use super::TaskContext;
-use crate::config::{TRAP_CONTEXT, kernel_stack_position};
-use crate::mm::{KERNEL_SPACE, MapPermission, MemorySet, PhysPageNum, VirtAddr};
-use crate::trap::{TrapContext, trap_handler};
+use crate::mm::{MemorySet, VirtAddr};
+use crate::trap::TrapContext;
 
 /// task control block structure
 pub struct TaskControlBlock {
     pub task_status: TaskStatus,
     pub task_cx: TaskContext,
     pub memory_set: MemorySet,
-    pub trap_cx_ppn: PhysPageNum,
+    /// virtual address of the `TrapContext` pushed on this task's kernel
+    /// stack. The kernel stack lives in the shared kernel high-half mapping,
+    /// so this address is valid under any active page table.
+    pub trap_cx_ptr: usize,
     #[allow(unused)]
     pub base_size: usize,
     pub heap_bottom: usize,
@@ -18,44 +20,29 @@ pub struct TaskControlBlock {
 
 impl TaskControlBlock {
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
-        self.trap_cx_ppn.get_mut()
+        unsafe { &mut *(self.trap_cx_ptr as *mut TrapContext) }
     }
     pub fn get_user_token(&self) -> usize {
         self.memory_set.token()
     }
     pub fn new(elf_data: &[u8], app_id: usize) -> Self {
-        // memory_set with elf program headers/trampoline/trap context/user stack
+        // memory_set with elf program headers/user stack
         let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
-        let trap_cx_ppn = memory_set
-            .translate(VirtAddr::from(TRAP_CONTEXT).into())
-            .unwrap()
-            .ppn();
         let task_status = TaskStatus::Ready;
-        // map a kernel-stack in kernel space
-        let (kernel_stack_bottom, kernel_stack_top) = kernel_stack_position(app_id);
-        KERNEL_SPACE.exclusive_access().insert_framed_area(
-            kernel_stack_bottom.into(),
-            kernel_stack_top.into(),
-            MapPermission::R | MapPermission::W,
+        // prepare a TrapContext on the task's kernel stack
+        let trap_cx_ptr = crate::loader::push_context(
+            app_id,
+            TrapContext::app_init_context(entry_point, user_sp),
         );
         let task_control_block = Self {
             task_status,
-            task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+            task_cx: TaskContext::goto_restore(trap_cx_ptr),
             memory_set,
-            trap_cx_ppn,
+            trap_cx_ptr,
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
         };
-        // prepare TrapContext in user space
-        let trap_cx = task_control_block.get_trap_cx();
-        *trap_cx = TrapContext::app_init_context(
-            entry_point,
-            user_sp,
-            KERNEL_SPACE.exclusive_access().token(),
-            kernel_stack_top,
-            linker_symbol_addr!(trap_handler),
-        );
         task_control_block
     }
     /// change the location of the program break. return None if failed.
@@ -82,7 +69,7 @@ impl TaskControlBlock {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-/// task status: UnInit, Ready, Running, Exited
+/// task status: Ready, Running, Exited
 pub enum TaskStatus {
     Ready,
     Running,
