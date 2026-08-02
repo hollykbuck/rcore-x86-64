@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["APIC_BASE_MSR","APIC_BASE_X2","APIC_TIMER_FREQ","INITIAL_COUNT","LAPIC_EOI","LAPIC_LVT_TIMER","LAPIC_TIMER_CURRENT_COUNT","LAPIC_TIMER_DIVIDE","LAPIC_TIMER_INIT_COUNT","TICKS_PER_SEC"],"fn":["elapsed_ticks","get_time_ms","init","lapic_read","lapic_write","rdmsr","set_next_trigger","tick","timer_eoi","wrmsr"],"static":["WRAPS"]};

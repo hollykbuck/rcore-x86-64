@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PA_WIDTH","PPN_WIDTH","VA_WIDTH","VPN_WIDTH"],"fn":["init_phys_virt_offset","phys_to_virt","phys_virt_offset"],"static":["PHYS_VIRT_OFFSET"],"struct":["PhysAddr","PhysPageNum","SimpleRange","SimpleRangeIterator","VirtAddr","VirtPageNum"],"trait":["StepByOne"],"type":["VPNRange"]};

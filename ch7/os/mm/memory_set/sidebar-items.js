@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MapType"],"fn":["ebss","egot","erodata","etext","ioremap","kernel_token","pte_flags_from_perm","sbss_with_stack","sdata","srodata","stext"],"struct":["KERNEL_SPACE","MapArea","MapPermission","MemorySet"]};

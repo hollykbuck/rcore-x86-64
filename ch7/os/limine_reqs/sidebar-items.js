@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["hhdm_offset","kernel_physical_base","memmap_entries"],"static":["limine_executable_address_request","limine_hhdm_request","limine_memmap_request"],"struct":["LimineExecutableAddressRequest","LimineExecutableAddressResponse","LimineHhdmRequest","LimineHhdmResponse","LimineMemmapEntry","LimineMemmapRequest","LimineMemmapResponse"]};

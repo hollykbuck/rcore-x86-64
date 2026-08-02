@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PTE_ADDR_MASK"],"fn":["translated_byte_buffer","translated_ref","translated_refmut","translated_str"],"struct":["PTEFlags","PageTable","PageTableEntry","UserBuffer","UserBufferIterator"]};

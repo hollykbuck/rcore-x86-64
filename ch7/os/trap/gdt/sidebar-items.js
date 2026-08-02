@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_OP_SIZE","DPL_USER","GRANULARITY_4K","KERNEL_CS","KERNEL_DS","LIMIT_HIGH","LONG_MODE","TSS_SELECTOR"],"fn":["segment","tss_segment"],"struct":["Gdt"]};
