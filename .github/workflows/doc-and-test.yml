@@ -20,6 +20,8 @@ jobs:
           components: rust-src, llvm-tools-preview
           target: x86_64-unknown-none
       - name: Build doc
+        env:
+          RUSTDOCFLAGS: -A rustdoc::all
         run: cd os && cargo doc --no-deps --verbose
       - name: Deploy to Github Pages
         uses: peaceiris/actions-gh-pages@v3
