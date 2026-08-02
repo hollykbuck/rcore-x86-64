@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["list_apps","open_file"],"mod":["inode","stdio"],"struct":["OSInode","OpenFlags","Stdin","Stdout"],"trait":["File"]};
