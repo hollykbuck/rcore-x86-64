@@ -15,14 +15,14 @@ pub const MEMORY_END: usize = 0x1000_0000;
 pub const LAPIC_BASE: usize = 0xFEE0_0000;
 
 /// Start of the per-process kernel stack region. This is the *start* of
-/// PML4[511]/PDPT[511], one PDPT entry above the kernel image (PDPT[510]).
+/// `PML4[511]`/`PDPT[511]`, one PDPT entry above the kernel image (`PDPT[510]`).
 pub const KERNEL_STACK_BASE: usize = 0xffffffffc0000000;
 
 /// Return (bottom, top) of the kernel stack of the process with `pid`.
 ///
 /// The layout **ascends** from `KERNEL_STACK_BASE` (one guard page between
-/// stacks) so it stays entirely within PDPT[511]. Descending from the base
-/// would fall into PDPT[510] (where the kernel image lives) -- verified with
+/// stacks) so it stays entirely within `PDPT[511]`. Descending from the base
+/// would fall into `PDPT[510]` (where the kernel image lives) -- verified with
 /// `pid = 1` landing at `0xffffffffbfffd000`.
 pub fn kernel_stack_position(pid: usize) -> (usize, usize) {
     let bottom = KERNEL_STACK_BASE + pid * (KERNEL_STACK_SIZE + PAGE_SIZE);
