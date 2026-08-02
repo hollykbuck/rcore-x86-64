@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["if_enabled","irqsave_enter","irqsave_exit"],"struct":["UPIntrFreeCell","UPIntrRefMut"]};

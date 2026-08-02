@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["POLL_YIELD_ITERS"],"fn":["blk_request","poll_yield"],"struct":["VirtIOBlock"]};

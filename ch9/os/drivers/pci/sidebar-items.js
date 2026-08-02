@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ECAM_BUS0_SIZE"],"fn":["ecam_base","pci_read_config_io"],"struct":["Pci"]};

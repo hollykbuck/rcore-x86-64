@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["IOAPIC_BASE","IOREGSEL","IOWIN"],"struct":["IoApic"]};

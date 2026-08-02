@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["COM1","IER_RX_AVAILABLE","LSR_DATA_READY","LSR_THR_EMPTY","MCR_OUT2","REG_FCR","REG_IER","REG_LCR","REG_LSR","REG_MCR","REG_RBR_THR"],"fn":["inb","outb"],"struct":["NS16550a","NS16550aInner"]};
