@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["KERNEL_BASE","PAGE_ADDR_MASK","PAGE_HUGE","PAGE_PRESENT","PAGE_USER","PAGE_WRITABLE","SZ_1G","SZ_2M","SZ_4K"],"fn":["init","read_cr3","translate"],"static":["PDPT_KERNEL","PDPT_LOW","PD_KERNEL","PD_LOW0","PD_LOW1","PD_LOW2","PD_LOW3","PML4","PT_KERNEL0","PT_KERNEL1","PT_KERNEL2","PT_KERNEL3"],"struct":["PageTable"]};

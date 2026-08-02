@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["hhdm_offset"],"static":["limine_hhdm_request"],"struct":["LimineHhdmRequest","LimineHhdmResponse"]};
