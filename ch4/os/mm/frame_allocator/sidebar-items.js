@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MEMMAP_USABLE"],"fn":["frame_alloc","frame_dealloc","init_frame_allocator"],"struct":["FRAME_ALLOCATOR","FrameDequeAllocator","FrameTracker"],"trait":["FrameAllocator"],"type":["FrameAllocatorImpl"]};
