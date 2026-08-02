@@ -1,5 +1,7 @@
+//! File and filesystem-related syscalls
+
 use crate::fs::{OpenFlags, make_pipe, open_file};
-use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut, translated_str};
+use crate::mm::{UserBuffer, translated_byte_buffer, translated_refmut};
 use crate::task::{current_process, current_user_token};
 use alloc::sync::Arc;
 
@@ -46,7 +48,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
 pub fn sys_open(path: *const u8, flags: u32) -> isize {
     let process = current_process();
     let token = current_user_token();
-    let path = translated_str(token, path);
+    let path = crate::mm::translated_str(token, path);
     if let Some(inode) = open_file(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
         let mut inner = process.inner_exclusive_access();
         let fd = inner.alloc_fd();
@@ -70,6 +72,8 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
+/// Create a pipe and write the read end / write end file descriptors into
+/// `[pipe[0], pipe[1]]`.
 pub fn sys_pipe(pipe: *mut usize) -> isize {
     let process = current_process();
     let token = current_user_token();
@@ -84,6 +88,7 @@ pub fn sys_pipe(pipe: *mut usize) -> isize {
     0
 }
 
+/// Duplicate a file descriptor (the new fd shares the same underlying file).
 pub fn sys_dup(fd: usize) -> isize {
     let process = current_process();
     let mut inner = process.inner_exclusive_access();

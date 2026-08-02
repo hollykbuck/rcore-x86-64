@@ -1,57 +1,66 @@
+//! Implementation of [`PageTableEntry`] and [`PageTable`].
+//!
+//! x86-64 4-level paging: PML4 -> PDPT -> PD -> PT. The top-level page
+//! table is pointed to by CR3, whose value is a physical address. Only 4KiB
+//! pages are used in this chapter.
+
 use super::{FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum, frame_alloc};
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+use core::arch::asm;
 
 bitflags! {
-    pub struct PTEFlags: u8 {
-        const V = 1 << 0;
-        const R = 1 << 1;
-        const W = 1 << 2;
-        const X = 1 << 3;
-        const U = 1 << 4;
-        const G = 1 << 5;
-        const A = 1 << 6;
-        const D = 1 << 7;
+    /// page table entry flags, x86-64 encoding
+    pub struct PTEFlags: u64 {
+        const V = 1 << 0;   // present
+        const W = 1 << 1;   // writable
+        const U = 1 << 2;   // user accessible
+        const PS = 1 << 7;  // page size (2MiB/1GiB)
+        const NX = 1 << 63; // not executable (honored iff EFER.NXE is set)
     }
 }
 
 #[derive(Copy, Clone)]
 #[repr(C)]
+/// page table entry structure
 pub struct PageTableEntry {
-    pub bits: usize,
+    pub bits: u64,
 }
+
+/// physical address bits of a page table entry
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 impl PageTableEntry {
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: (ppn.0 as u64) << 12 | flags.bits,
         }
     }
     pub fn empty() -> Self {
         PageTableEntry { bits: 0 }
     }
     pub fn ppn(&self) -> PhysPageNum {
-        (self.bits >> 10 & ((1usize << 44) - 1)).into()
+        PhysPageNum(((self.bits & PTE_ADDR_MASK) >> 12) as usize)
     }
     pub fn flags(&self) -> PTEFlags {
-        PTEFlags::from_bits(self.bits as u8).unwrap()
+        // the address bits (12..52) are not part of the flag bitflags, so
+        // they must be dropped before decoding (unlike SV39 where the flags
+        // live in a byte of their own)
+        PTEFlags::from_bits_truncate(self.bits)
     }
     pub fn is_valid(&self) -> bool {
         (self.flags() & PTEFlags::V) != PTEFlags::empty()
-    }
-    pub fn readable(&self) -> bool {
-        (self.flags() & PTEFlags::R) != PTEFlags::empty()
     }
     pub fn writable(&self) -> bool {
         (self.flags() & PTEFlags::W) != PTEFlags::empty()
     }
     pub fn executable(&self) -> bool {
-        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+        (self.flags() & PTEFlags::NX) == PTEFlags::empty()
     }
 }
 
+/// page table structure
 pub struct PageTable {
     root_ppn: PhysPageNum,
     frames: Vec<FrameTracker>,
@@ -66,12 +75,9 @@ impl PageTable {
             frames: vec![frame],
         }
     }
-    /// Temporarily used to get arguments from user space.
-    pub fn from_token(satp: usize) -> Self {
-        Self {
-            root_ppn: PhysPageNum::from(satp & ((1usize << 44) - 1)),
-            frames: Vec::new(),
-        }
+    /// The value to load into CR3: the physical address of the PML4.
+    pub fn root_ppn(&self) -> PhysPageNum {
+        self.root_ppn
     }
     fn find_pte_create(&mut self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
         let idxs = vpn.indexes();
@@ -79,13 +85,17 @@ impl PageTable {
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
+            if i == 3 {
                 result = Some(pte);
                 break;
             }
             if !pte.is_valid() {
                 let frame = frame_alloc().unwrap();
-                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
+                // intermediate entries must allow user access and writes:
+                // on x86 the W and U bits are checked at *every* level of the
+                // walk (unlike SV39, which only checks the leaf), so V|W|U is
+                // required for both kernel writes and ring-3 accesses
+                *pte = PageTableEntry::new(frame.ppn, PTEFlags::V | PTEFlags::W | PTEFlags::U);
                 self.frames.push(frame);
             }
             ppn = pte.ppn();
@@ -98,7 +108,7 @@ impl PageTable {
         let mut result: Option<&mut PageTableEntry> = None;
         for (i, idx) in idxs.iter().enumerate() {
             let pte = &mut ppn.get_pte_array()[*idx];
-            if i == 2 {
+            if i == 3 {
                 result = Some(pte);
                 break;
             }
@@ -120,23 +130,42 @@ impl PageTable {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+        // The TLB may still cache the old mapping of this page in the current
+        // address space; there is no `sfence.vma` on x86, so invalidate the
+        // single page explicitly. (Without this, a just-freed sbrk page keeps
+        // being accessible.)
+        let va: VirtAddr = vpn.into();
+        unsafe {
+            asm!("invlpg [{0}]", in(reg) usize::from(va), options(nostack));
+        }
     }
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
+    /// A read-only `PageTable` rooted at the given root page table address,
+    /// used to walk a user address space for argument translation.
+    pub fn from_token(token: usize) -> Self {
+        Self {
+            root_ppn: PhysPageNum::from(token >> 12),
+            frames: Vec::new(),
+        }
+    }
+    /// Translate `VirtAddr` to `PhysAddr`.
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
+        self.find_pte(va.floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();
-            let offset = va.page_offset();
-            let aligned_pa_usize: usize = aligned_pa.into();
-            (aligned_pa_usize + offset).into()
+            (aligned_pa.0 + va.page_offset()).into()
         })
     }
+    /// The value to write into CR3: the **physical address** of the PML4
+    /// (`PhysPageNum` is a frame index, CR3 wants an address).
     pub fn token(&self) -> usize {
-        8usize << 60 | self.root_ppn.0
+        self.root_ppn.0 << 12
     }
 }
 
+/// Translate a pointer to a mutable u8 Vec through page table
+#[allow(dead_code)]
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
@@ -159,10 +188,11 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v
 }
 
-/// Load a string from other address spaces into kernel space without an end `\0`.
-pub fn translated_str(token: usize, ptr: *const u8) -> String {
+/// Translate a pointer to a mutable u8 Vec end with `\0` through page table to a `String`
+#[allow(dead_code)]
+pub fn translated_str(token: usize, ptr: *const u8) -> alloc::string::String {
     let page_table = PageTable::from_token(token);
-    let mut string = String::new();
+    let mut string = alloc::string::String::new();
     let mut va = ptr as usize;
     loop {
         let ch: u8 = *(page_table
@@ -178,6 +208,8 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
     string
 }
 
+#[allow(unused)]
+/// Translate a generic through page table and return a reference
 pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
     let page_table = PageTable::from_token(token);
     page_table
@@ -185,7 +217,8 @@ pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
         .unwrap()
         .get_ref()
 }
-
+/// Translate a generic through page table and return a mutable reference
+#[allow(dead_code)]
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
     let page_table = PageTable::from_token(token);
     let va = ptr as usize;
@@ -194,15 +227,18 @@ pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
         .unwrap()
         .get_mut()
 }
-
+/// Array of u8 slice that user communicate with os
 pub struct UserBuffer {
+    /// U8 vec
     pub buffers: Vec<&'static mut [u8]>,
 }
 
 impl UserBuffer {
+    /// Create a `UserBuffer` by parameter
     pub fn new(buffers: Vec<&'static mut [u8]>) -> Self {
         Self { buffers }
     }
+    /// Length of `UserBuffer`
     pub fn len(&self) -> usize {
         let mut total: usize = 0;
         for b in self.buffers.iter() {
@@ -223,7 +259,7 @@ impl IntoIterator for UserBuffer {
         }
     }
 }
-
+/// Iterator of `UserBuffer`
 pub struct UserBufferIterator {
     buffers: Vec<&'static mut [u8]>,
     current_buffer: usize,

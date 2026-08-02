@@ -1,4 +1,4 @@
-use super::{SignalFlags, getpid, kill};
+use super::{SIGABRT, getpid, kill};
 
 #[panic_handler]
 fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
@@ -13,6 +13,8 @@ fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
     } else {
         println!("Panicked: {}", err);
     }
-    kill(getpid() as usize, SignalFlags::SIGABRT.bits());
+    // `SIGABRT` here is the signal *number* (6), not the bit mask: the kernel
+    // translates `1 << signum` to the pending-signal bit.
+    kill(getpid() as usize, SIGABRT);
     unreachable!()
 }

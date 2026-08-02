@@ -1,9 +1,10 @@
+//! Stdin & Stdout
 use super::File;
-use crate::drivers::chardev::CharDevice;
-use crate::drivers::chardev::UART;
+use crate::drivers::UART;
 use crate::mm::UserBuffer;
-
+/// Standard input
 pub struct Stdin;
+/// Standard output
 pub struct Stdout;
 
 impl File for Stdin {
@@ -15,7 +16,7 @@ impl File for Stdin {
     }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
         assert_eq!(user_buf.len(), 1);
-        //println!("before UART.read() in Stdin::read()");
+        // interrupt-driven: block until the UART IRQ delivers a byte (ch9)
         let ch = UART.read();
         unsafe {
             user_buf.buffers[0].as_mut_ptr().write_volatile(ch);

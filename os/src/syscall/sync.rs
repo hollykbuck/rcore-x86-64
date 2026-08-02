@@ -1,8 +1,12 @@
+//! Synchronization and sleep syscalls (ch8): `sleep`, `mutex_*`,
+//! `semaphore_*`, `condvar_*`.
+
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
 
+/// Sleep for `ms` milliseconds, blocking the current thread.
 pub fn sys_sleep(ms: usize) -> isize {
     let expire_ms = get_time_ms() + ms;
     let task = current_task().unwrap();
@@ -11,6 +15,7 @@ pub fn sys_sleep(ms: usize) -> isize {
     0
 }
 
+/// Create a mutex; `blocking` selects `MutexBlocking` over `MutexSpin`.
 pub fn sys_mutex_create(blocking: bool) -> isize {
     let process = current_process();
     let mutex: Option<Arc<dyn Mutex>> = if !blocking {
@@ -34,6 +39,7 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
     }
 }
 
+/// Lock `mutex_id`.
 pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
@@ -44,6 +50,7 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     0
 }
 
+/// Unlock `mutex_id`.
 pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
@@ -54,6 +61,7 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     0
 }
 
+/// Create a semaphore with `res_count` resources.
 pub fn sys_semaphore_create(res_count: usize) -> isize {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
@@ -75,6 +83,7 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
     id as isize
 }
 
+/// Release a resource of `sem_id`.
 pub fn sys_semaphore_up(sem_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
@@ -84,6 +93,7 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
     0
 }
 
+/// Acquire a resource of `sem_id`, blocking if none is free.
 pub fn sys_semaphore_down(sem_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
@@ -93,6 +103,7 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
     0
 }
 
+/// Create a condition variable.
 pub fn sys_condvar_create() -> isize {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
@@ -114,6 +125,7 @@ pub fn sys_condvar_create() -> isize {
     id as isize
 }
 
+/// Signal `condvar_id`, waking one waiter.
 pub fn sys_condvar_signal(condvar_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
@@ -123,12 +135,13 @@ pub fn sys_condvar_signal(condvar_id: usize) -> isize {
     0
 }
 
+/// Wait on `condvar_id` while holding `mutex_id`.
 pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     let process = current_process();
     let process_inner = process.inner_exclusive_access();
     let condvar = Arc::clone(process_inner.condvar_list[condvar_id].as_ref().unwrap());
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
-    condvar.wait_with_mutex(mutex);
+    condvar.wait(mutex);
     0
 }

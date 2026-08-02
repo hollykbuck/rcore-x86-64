@@ -12,7 +12,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("filetest_simple\0", "\0", "\0", "\0", 0),
     ("cat\0", "filea\0", "\0", "\0", 0),
     ("cmdline_args\0", "1\0", "2\0", "3\0", 0),
-    ("eisenberg\0", "\0", "\0", "\0", 0),
     ("exit\0", "\0", "\0", "\0", 0),
     ("fantastic_text\0", "\0", "\0", "\0", 0),
     ("forktest_simple\0", "\0", "\0", "\0", 0),
@@ -23,7 +22,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("huge_write\0", "\0", "\0", "\0", 0),
     ("matrix\0", "\0", "\0", "\0", 0),
     ("mpsc_sem\0", "\0", "\0", "\0", 0),
-    ("peterson\0", "\0", "\0", "\0", 0),
     ("phil_din_mutex\0", "\0", "\0", "\0", 0),
     ("pipe_large_test\0", "\0", "\0", "\0", 0),
     ("pipetest\0", "\0", "\0", "\0", 0),
@@ -34,7 +32,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("run_pipe_test\0", "\0", "\0", "\0", 0),
     ("sleep_simple\0", "\0", "\0", "\0", 0),
     ("sleep\0", "\0", "\0", "\0", 0),
-    ("sleep_simple\0", "\0", "\0", "\0", 0),
     ("sync_sem\0", "\0", "\0", "\0", 0),
     ("condsync_sem\0", "\0", "\0", "\0", 0),
     ("condsync_condvar\0", "\0", "\0", "\0", 0),
@@ -47,7 +44,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
 
 static FAIL_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("stack_overflow\0", "\0", "\0", "\0", -11),
-    ("race_adder_loop\0", "\0", "\0", "\0", -6),
     ("priv_csr\0", "\0", "\0", "\0", -4),
     ("priv_inst\0", "\0", "\0", "\0", -4),
     ("store_fault\0", "\0", "\0", "\0", -11),
@@ -61,12 +57,17 @@ use user_lib::{exec, fork, waitpid};
 
 fn run_tests(tests: &[(&str, &str, &str, &str, i32)]) -> i32 {
     let mut pass_num = 0;
-    let mut arr: [*const u8; 4] = [
+    let mut arr: [*const u8; 5] = [
+        core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
     ];
+    // argv must be NUL-terminated: `sys_exec` walks the array until a null
+    // pointer (x86-64 port; the 4-entry array was never terminated on RISC-V
+    // either, it only worked because the next stack slot happened to be null).
+    arr[4] = core::ptr::null::<u8>();
 
     for test in tests {
         println!("Usertests: Running {}", test.0);

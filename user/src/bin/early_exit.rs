@@ -1,0 +1,22 @@
+#![no_std]
+#![no_main]
+
+#[macro_use]
+extern crate user_lib;
+extern crate alloc;
+
+use user_lib::{exit, thread_create};
+
+pub fn thread_a() -> ! {
+    for i in 0..1000 {
+        print!("{}", i);
+    }
+    exit(1)
+}
+
+#[unsafe(no_mangle)]
+pub fn main() -> i32 {
+    thread_create(linker_symbol_addr!(thread_a), 0);
+    println!("main thread exited.");
+    exit(0)
+}

@@ -23,10 +23,6 @@ impl BlockDevice for BlockFile {
             .expect("Error when seeking!");
         assert_eq!(file.write(buf).unwrap(), BLOCK_SZ, "Not a complete block!");
     }
-
-    fn handle_irq(&self) {
-        unimplemented!();
-    }
 }
 
 fn main() {
@@ -59,18 +55,27 @@ fn easy_fs_pack() -> std::io::Result<()> {
             .write(true)
             .create(true)
             .open(format!("{}{}", target_path, "fs.img"))?;
-        f.set_len(32 * 2048 * 512).unwrap();
+        f.set_len(16 * 2048 * 512).unwrap();
         f
     })));
-    // 32MiB, at most 4095 files
-    let efs = EasyFileSystem::create(block_file, 32 * 2048, 1);
+    // 16MiB, at most 4095 files
+    let efs = EasyFileSystem::create(block_file, 16 * 2048, 1);
     let root_inode = Arc::new(EasyFileSystem::root_inode(&efs));
     let apps: Vec<_> = read_dir(src_path)
         .unwrap()
         .into_iter()
-        .filter_map(|dir_entry| {
-            let name_with_ext = dir_entry.ok()?.file_name().into_string().ok()?;
-            name_with_ext.strip_suffix(".rs").map(str::to_owned)
+        .filter(|dir_entry| {
+            dir_entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".rs")
+        })
+        .map(|dir_entry| {
+            let mut name_with_ext = dir_entry.unwrap().file_name().into_string().unwrap();
+            name_with_ext.drain(name_with_ext.find('.').unwrap()..name_with_ext.len());
+            name_with_ext
         })
         .collect();
     for app in apps {
@@ -83,6 +88,9 @@ fn easy_fs_pack() -> std::io::Result<()> {
         // write data to easy-fs
         inode.write_at(0, all_data.as_slice());
     }
+    // pre-create the `filea` file used by `cat filea`/`cat_filea`
+    let filea = root_inode.create("filea").unwrap();
+    filea.write_at(0, b"Hello, world!");
     // list apps
     // for app in root_inode.ls() {
     //     println!("{}", app);
