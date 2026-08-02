@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EFER_MSR","EFER_SCE","LSTAR_MSR","SFMASK_MSR","STAR_MSR"],"fn":["rdmsr","syscall_init","wrmsr"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["console_putchar","init","shutdown"]};

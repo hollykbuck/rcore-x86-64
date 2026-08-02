@@ -1,0 +1,2 @@
+createSrcSidebar('[["os",["",[["sync",[],["mod.rs","up.rs"]],["syscall",[],["fs.rs","mod.rs","process.rs"]],["trap",[],["context.rs","gdt.rs","idt.rs","mod.rs","msr.rs","paging.rs","tss.rs"]]],["batch.rs","console.rs","lang_items.rs","limine_reqs.rs","logging.rs","main.rs","uart.rs"]]]]');
+//{"start":19,"fragment_lengths":[267]}
