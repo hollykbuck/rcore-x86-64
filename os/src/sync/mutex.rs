@@ -1,19 +1,26 @@
+//! Mutex implementations (kernel-level, taken from the RISC-V tutorial ch8).
+
 use super::UPSafeCell;
 use crate::task::TaskControlBlock;
 use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
 use crate::task::{current_task, wakeup_task};
 use alloc::{collections::VecDeque, sync::Arc};
 
+/// The `Mutex` trait.
 pub trait Mutex: Sync + Send {
+    /// Try to acquire the lock, blocking/suspending the current thread.
     fn lock(&self);
+    /// Release the lock, possibly waking up a waiter.
     fn unlock(&self);
 }
 
+/// A spin (cooperative) mutex: the waiter yields until the lock is free.
 pub struct MutexSpin {
     locked: UPSafeCell<bool>,
 }
 
 impl MutexSpin {
+    /// Create a new `MutexSpin`.
     pub fn new() -> Self {
         Self {
             locked: unsafe { UPSafeCell::new(false) },
@@ -42,16 +49,18 @@ impl Mutex for MutexSpin {
     }
 }
 
+/// A blocking mutex: the waiter blocks and is woken up on unlock.
 pub struct MutexBlocking {
     inner: UPSafeCell<MutexBlockingInner>,
 }
 
-pub struct MutexBlockingInner {
+struct MutexBlockingInner {
     locked: bool,
     wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
 impl MutexBlocking {
+    /// Create a new `MutexBlocking`.
     pub fn new() -> Self {
         Self {
             inner: unsafe {

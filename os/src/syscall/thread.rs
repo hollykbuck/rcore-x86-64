@@ -1,10 +1,14 @@
-use crate::{
-    mm::kernel_token,
-    task::{TaskControlBlock, add_task, current_task},
-    trap::{TrapContext, trap_handler},
-};
+//! Thread management syscalls (`thread_create`/`gettid`/`waittid`).
+use crate::task::{TaskControlBlock, add_task, current_task};
+use crate::trap::TrapContext;
 use alloc::sync::Arc;
 
+/// Create a new thread of the current process, with entry point `entry` and
+/// argument `arg`.
+///
+/// x86-64 note: the thread's trap context is written with the entry point in
+/// `rip` and the argument in `rdi` (SysV first argument register); the user
+/// stack is a fresh per-thread stack mapped into the process's address space.
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
@@ -15,7 +19,7 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
             .res
             .as_ref()
             .unwrap()
-            .ustack_base,
+            .ustack_base(),
         true,
     ));
     // add new task to scheduler
@@ -31,17 +35,12 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     }
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
     let new_task_trap_cx = new_task_inner.get_trap_cx();
-    *new_task_trap_cx = TrapContext::app_init_context(
-        entry,
-        new_task_res.ustack_top(),
-        kernel_token(),
-        new_task.kstack.get_top(),
-        linker_symbol_addr!(trap_handler),
-    );
-    (*new_task_trap_cx).x[10] = arg;
+    *new_task_trap_cx = TrapContext::app_init_context(entry, new_task_res.ustack_top());
+    new_task_trap_cx.rdi = arg;
     new_task_tid as isize
 }
 
+/// Get the tid of the current thread.
 pub fn sys_gettid() -> isize {
     current_task()
         .unwrap()
@@ -52,6 +51,8 @@ pub fn sys_gettid() -> isize {
         .tid as isize
 }
 
+/// Wait for the thread `tid` of the current process.
+///
 /// thread does not exist, return -1
 /// thread has not exited yet, return -2
 /// otherwise, return thread's exit code

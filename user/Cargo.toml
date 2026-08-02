@@ -9,8 +9,7 @@ edition = "2024"
 [dependencies]
 buddy_system_allocator = "0.6"
 bitflags = "1.2.1"
-riscv = { version = "0.16", features = ["s-mode"] }
-lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 [profile.release]
 debug = true

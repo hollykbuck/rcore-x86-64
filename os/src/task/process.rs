@@ -1,20 +1,25 @@
+//! Implementation of [`ProcessControlBlock`]: the process-wide state shared
+//! by all threads (the address space, the file descriptor table, the signals,
+//! the children, ...).
+
 use super::TaskControlBlock;
 use super::id::RecycleAllocator;
 use super::manager::insert_into_pid2process;
-use super::{PidHandle, pid_alloc};
-use super::{SignalFlags, add_task};
+use super::{PidHandle, SignalActions, SignalFlags, add_task, pid_alloc};
+use crate::config::USER_STACK_SIZE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
+use crate::mm::{MemorySet, translated_refmut};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
-use crate::trap::{TrapContext, trap_handler};
+use crate::trap::TrapContext;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// The process-wide state shared by all threads of the process.
 pub struct ProcessControlBlock {
-    // immutable
+    /// the pid, immutable
     pub pid: PidHandle,
     // mutable
     inner: UPSafeCell<ProcessControlBlockInner>,
@@ -28,10 +33,20 @@ pub struct ProcessControlBlockInner {
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
     pub signals: SignalFlags,
+    pub signal_mask: SignalFlags,
+    pub handling_sig: isize,
+    pub signal_actions: SignalActions,
+    pub killed: bool,
+    pub frozen: bool,
+    pub trap_ctx_backup: Option<TrapContext>,
+    /// the threads of this process, indexed by tid
     pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
     pub task_res_allocator: RecycleAllocator,
+    /// kernel-level mutexes of this process, indexed by id
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
+    /// kernel-level semaphores of this process, indexed by id
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+    /// kernel-level condition variables of this process, indexed by id
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
 }
 
@@ -68,13 +83,18 @@ impl ProcessControlBlockInner {
 }
 
 impl ProcessControlBlock {
+    /// Get the mutable reference to the inner structure of the process.
     pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
 
+    /// Load a new process from `elf_data`.
     pub fn new(elf_data: &[u8]) -> Arc<Self> {
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        // memory_set with elf program headers and the main-thread user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        // bottom of the main-thread user stack (the per-thread stacks of
+        // additional threads are mapped above it, see `TaskUserRes`)
+        let ustack_base = user_sp - USER_STACK_SIZE;
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -95,6 +115,12 @@ impl ProcessControlBlock {
                         Some(Arc::new(Stdout)),
                     ],
                     signals: SignalFlags::empty(),
+                    signal_mask: SignalFlags::empty(),
+                    handling_sig: -1,
+                    signal_actions: SignalActions::default(),
+                    killed: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -103,51 +129,45 @@ impl ProcessControlBlock {
                 })
             },
         });
-        // create a main thread, we should allocate ustack and trap_cx here
-        let task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&process),
-            ustack_base,
-            true,
-        ));
-        // prepare trap_cx of main thread
+        // create the main thread; its user stack is already mapped by
+        // `MemorySet::from_elf`, so do not allocate user resources again
+        let task = Arc::new(TaskControlBlock::new(Arc::clone(&process), ustack_base, false));
+        // prepare the trap context of the main thread
         let task_inner = task.inner_exclusive_access();
         let trap_cx = task_inner.get_trap_cx();
         let ustack_top = task_inner.res.as_ref().unwrap().ustack_top();
-        let kstack_top = task.kstack.get_top();
         drop(task_inner);
-        *trap_cx = TrapContext::app_init_context(
-            entry_point,
-            ustack_top,
-            KERNEL_SPACE.exclusive_access().token(),
-            kstack_top,
-            linker_symbol_addr!(trap_handler),
-        );
-        // add main thread to the process
+        *trap_cx = TrapContext::app_init_context(entry_point, ustack_top);
+        // add the main thread to the process
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
-        // add main thread to scheduler
+        // add the main thread to the scheduler
         add_task(task);
         process
     }
 
-    /// Only support processes with a single thread.
+    /// Load a new program image into this process (the `exec` syscall).
+    ///
+    /// x86-64 note: the trap entry does not switch CR3, so the new address
+    /// space must be activated here; otherwise the `iretq` back to user mode
+    /// would execute the new entry point under the old page table.
     pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
-        // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        // memory_set with elf program headers and the main-thread user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let ustack_base = user_sp - USER_STACK_SIZE;
         let new_token = memory_set.token();
-        // substitute memory_set
+        // substitute the memory set (the old one is dropped, freeing frames)
         self.inner_exclusive_access().memory_set = memory_set;
-        // then we alloc user resource for main thread again
-        // since memory_set has been changed
+        // rebase the main-thread user stack on the new address space
         let task = self.inner_exclusive_access().get_task(0);
         let mut task_inner = task.inner_exclusive_access();
         task_inner.res.as_mut().unwrap().ustack_base = ustack_base;
-        task_inner.res.as_mut().unwrap().alloc_user_res();
-        task_inner.trap_cx_ppn = task_inner.res.as_mut().unwrap().trap_cx_ppn();
-        // push arguments on user stack
+        // push the command line arguments on the user stack (NUL-terminated
+        // argv pointer array followed by each argument string), keeping the
+        // stack 16-byte aligned (x86-64 SysV ABI)
         let mut user_sp = task_inner.res.as_mut().unwrap().ustack_top();
         user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
         let argv_base = user_sp;
@@ -170,39 +190,33 @@ impl ProcessControlBlock {
             }
             *translated_refmut(new_token, p as *mut u8) = 0;
         }
-        // make the user_sp aligned to 8B for k210 platform
-        user_sp -= user_sp % core::mem::size_of::<usize>();
-        // initialize trap_cx
-        let mut trap_cx = TrapContext::app_init_context(
-            entry_point,
-            user_sp,
-            KERNEL_SPACE.exclusive_access().token(),
-            task.kstack.get_top(),
-            linker_symbol_addr!(trap_handler),
-        );
-        trap_cx.x[10] = args.len();
-        trap_cx.x[11] = argv_base;
+        user_sp -= user_sp % 16;
+        // rebuild the trap context (argc/argv in RDI/RSI)
+        let mut trap_cx = TrapContext::app_init_context(entry_point, user_sp);
+        trap_cx.rdi = args.len();
+        trap_cx.rsi = argv_base;
         *task_inner.get_trap_cx() = trap_cx;
+        drop(task_inner);
+        // switch to the new address space now
+        self.inner_exclusive_access().memory_set.activate();
     }
 
-    /// Only support processes with a single thread.
+    /// Create a child process by copying the current one (the `fork` syscall).
+    ///
+    /// Only supports processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
+        // clone parent's address space completely (including all user stacks)
         let memory_set = MemorySet::from_existed_user(&parent.memory_set);
         // alloc a pid
         let pid = pid_alloc();
-        // copy fd table
+        // copy the fd table (sharing the underlying files)
         let mut new_fd_table: Vec<Option<Arc<dyn File + Send + Sync>>> = Vec::new();
         for fd in parent.fd_table.iter() {
-            if let Some(file) = fd {
-                new_fd_table.push(Some(file.clone()));
-            } else {
-                new_fd_table.push(None);
-            }
+            new_fd_table.push(fd.clone());
         }
-        // create child process pcb
+        // create the child process pcb
         let child = Arc::new(Self {
             pid,
             inner: unsafe {
@@ -214,6 +228,13 @@ impl ProcessControlBlock {
                     exit_code: 0,
                     fd_table: new_fd_table,
                     signals: SignalFlags::empty(),
+                    // inherit the signal_mask and signal_action
+                    signal_mask: parent.signal_mask,
+                    handling_sig: -1,
+                    signal_actions: parent.signal_actions.clone(),
+                    killed: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
                     tasks: Vec::new(),
                     task_res_allocator: RecycleAllocator::new(),
                     mutex_list: Vec::new(),
@@ -222,9 +243,10 @@ impl ProcessControlBlock {
                 })
             },
         });
-        // add child
+        // add child to parent's children
         parent.children.push(Arc::clone(&child));
-        // create main thread of child process
+        // create the main thread of the child process (user stack already
+        // copied with the address space, so no user resources are allocated)
         let task = Arc::new(TaskControlBlock::new(
             Arc::clone(&child),
             parent
@@ -234,25 +256,26 @@ impl ProcessControlBlock {
                 .as_ref()
                 .unwrap()
                 .ustack_base(),
-            // here we do not allocate trap_cx or ustack again
-            // but mention that we allocate a new kstack here
             false,
         ));
-        // attach task to child process
+        // attach the thread to the child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
         drop(child_inner);
-        // modify kstack_top in trap_cx of this thread
+        // copy the parent's current trap context, with rax = 0 so that `fork`
+        // returns 0 in the child
+        let mut child_trap_cx = *parent.get_task(0).inner_exclusive_access().get_trap_cx();
+        child_trap_cx.rax = 0;
         let task_inner = task.inner_exclusive_access();
-        let trap_cx = task_inner.get_trap_cx();
-        trap_cx.kernel_sp = task.kstack.get_top();
+        *task_inner.get_trap_cx() = child_trap_cx;
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        // add this thread to scheduler
+        // add the thread to the scheduler
         add_task(task);
         child
     }
 
+    /// Get the pid of this process.
     pub fn getpid(&self) -> usize {
         self.pid.0
     }

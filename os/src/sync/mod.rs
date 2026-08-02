@@ -1,3 +1,5 @@
+//! Synchronization and interior mutability primitives
+
 mod condvar;
 mod mutex;
 mod semaphore;

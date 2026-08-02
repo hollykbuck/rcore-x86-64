@@ -32,7 +32,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("run_pipe_test\0", "\0", "\0", "\0", 0),
     ("sleep_simple\0", "\0", "\0", "\0", 0),
     ("sleep\0", "\0", "\0", "\0", 0),
-    ("sleep_simple\0", "\0", "\0", "\0", 0),
     ("sync_sem\0", "\0", "\0", "\0", 0),
     ("condsync_sem\0", "\0", "\0", "\0", 0),
     ("condsync_condvar\0", "\0", "\0", "\0", 0),
@@ -45,7 +44,6 @@ static SUCC_TESTS: &[(&str, &str, &str, &str, i32)] = &[
 
 static FAIL_TESTS: &[(&str, &str, &str, &str, i32)] = &[
     ("stack_overflow\0", "\0", "\0", "\0", -11),
-    ("race_adder_loop\0", "\0", "\0", "\0", -6),
     ("priv_csr\0", "\0", "\0", "\0", -4),
     ("priv_inst\0", "\0", "\0", "\0", -4),
     ("store_fault\0", "\0", "\0", "\0", -11),

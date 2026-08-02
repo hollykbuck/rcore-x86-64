@@ -64,9 +64,18 @@ fn easy_fs_pack() -> std::io::Result<()> {
     let apps: Vec<_> = read_dir(src_path)
         .unwrap()
         .into_iter()
-        .filter_map(|dir_entry| {
-            let name_with_ext = dir_entry.ok()?.file_name().into_string().ok()?;
-            name_with_ext.strip_suffix(".rs").map(str::to_owned)
+        .filter(|dir_entry| {
+            dir_entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".rs")
+        })
+        .map(|dir_entry| {
+            let mut name_with_ext = dir_entry.unwrap().file_name().into_string().unwrap();
+            name_with_ext.drain(name_with_ext.find('.').unwrap()..name_with_ext.len());
+            name_with_ext
         })
         .collect();
     for app in apps {
@@ -79,6 +88,9 @@ fn easy_fs_pack() -> std::io::Result<()> {
         // write data to easy-fs
         inode.write_at(0, all_data.as_slice());
     }
+    // pre-create the `filea` file used by `cat filea`/`cat_filea`
+    let filea = root_inode.create("filea").unwrap();
+    filea.write_at(0, b"Hello, world!");
     // list apps
     // for app in root_inode.ls() {
     //     println!("{}", app);

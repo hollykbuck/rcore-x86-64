@@ -3,6 +3,7 @@
 // https://github.com/cfsamson/example-greenthreads
 #![no_std]
 #![no_main]
+#![allow(bad_asm_style)]
 
 extern crate alloc;
 #[macro_use]
@@ -192,16 +193,18 @@ impl Runtime {
         unsafe {
             let s_ptr = available.stack.as_mut_ptr().offset(size as isize);
 
-            // make sure our stack itself is 8 byte aligned - it will always
-            // offset to a lower memory address. Since we know we're at the "high"
-            // memory address of our allocated space, we know that offsetting to
-            // a lower one will be a valid address (given that we actually allocated)
-            // enough space to actually get an aligned pointer in the first place).
-            let s_ptr = (s_ptr as usize & !7) as *mut u8;
+            // make sure our stack itself is 16 byte aligned (x86-64 SysV ABI:
+            // on function entry `rsp % 16 == 8`, since the return address has
+            // just been pushed)
+            let s_ptr = (s_ptr as usize & !15) as *mut u8;
 
-            available.ctx.x1 = linker_symbol_addr!(guard) as u64; //ctx.x1  is old return address
-            available.ctx.nx1 = linker_symbol_addr!(f) as u64; //ctx.nx2 is new return address
-            available.ctx.x2 = s_ptr.offset(-32) as u64; //cxt.x2 is sp
+            // x86-64: place the guard function as the return address on the
+            // new stack, so when the coroutine body returns, `ret` lands on
+            // `guard`. `x1` is the first jump target (the coroutine body).
+            let guard_addr = linker_symbol_addr!(guard) as u64;
+            *(s_ptr.offset(-8) as *mut u64) = guard_addr;
+            available.ctx.x1 = linker_symbol_addr!(f) as u64;
+            available.ctx.x2 = s_ptr.offset(-8) as u64;
         }
         available.state = State::Ready;
     }
