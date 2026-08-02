@@ -19,8 +19,8 @@ env:
 	rustup component add llvm-tools-preview
 	if [ ! -f "$(LIMINE_STAMP)" ]; then \
 		echo "  Downloading Limine $(LIMINE_VERSION)..."; \
-		gh release download --clobber --repo limine-bootloader/limine -p "limine-binary.tar.gz" \
-			-D /tmp/ && \
+		curl -L --fail -o /tmp/limine-binary.tar.gz \
+			"https://github.com/limine-bootloader/limine/releases/download/v$(LIMINE_VERSION)/limine-binary.tar.gz" && \
 		mkdir -p "$(LIMINE_DIR)" && \
 		tar xzf /tmp/limine-binary.tar.gz -C "$(LIMINE_DIR)" --strip-components=1 && \
 		rm -f /tmp/limine-binary.tar.gz && \
