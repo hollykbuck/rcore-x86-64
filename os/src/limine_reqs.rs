@@ -53,6 +53,17 @@ global_asm!(
     ".quad 0",
     ".quad 0",
 
+    // LIMINE_MP_REQUEST
+    ".global limine_mp_request",
+    "limine_mp_request:",
+    ".quad 0xc7b1dd30df4c8b88",
+    ".quad 0x0a82e883a194f07b",
+    ".quad 0x95a67b819a1b857e",
+    ".quad 0xa0b61b723b6a73e0",
+    ".quad 0",
+    ".quad 0",
+    ".quad 0",
+
     // LIMINE_REQUESTS_END_MARKER
     ".quad 0xadc0e0531bb10d03",
     ".quad 0x9572709f31764c62",
@@ -131,10 +142,54 @@ pub struct LimineExecutableAddressRequest {
     pub response: Option<&'static mut LimineExecutableAddressResponse>,
 }
 
+/// Per-processor info returned by the Limine MP protocol.
+#[repr(C)]
+pub struct LimineMpInfo {
+    /// ACPI Processor UID from the MADT
+    pub processor_id: u32,
+    /// Local APIC ID of the processor
+    pub lapic_id: u32,
+    /// reserved for bootloader use
+    pub reserved: u64,
+    /// an atomic (release) write here makes the parked processor jump to it
+    pub goto_address: u64,
+    /// free for use by the kernel
+    pub extra_argument: u64,
+}
+
+/// The response of `limine_mp_request`.
+#[repr(C)]
+pub struct LimineMpResponse {
+    pub revision: u64,
+    pub flags: u32,
+    /// the Local APIC ID of the bootstrap processor
+    pub bsp_lapic_id: u32,
+    /// number of CPUs (including the bootstrap processor)
+    pub cpu_count: u64,
+    /// pointer to an array of `cpu_count` pointers to `LimineMpInfo`
+    pub cpus: *mut *mut LimineMpInfo,
+}
+
+/// The MP request
+#[repr(C)]
+pub struct LimineMpRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: Option<&'static mut LimineMpResponse>,
+}
+
 unsafe extern "C" {
     static mut limine_hhdm_request: LimineHhdmRequest;
     static mut limine_memmap_request: LimineMemmapRequest;
     static mut limine_executable_address_request: LimineExecutableAddressRequest;
+    static mut limine_mp_request: LimineMpRequest;
+}
+
+/// The Limine MP response, if the bootloader provided one.
+pub fn mp_response() -> Option<&'static mut LimineMpResponse> {
+    let req = core::ptr::addr_of_mut!(limine_mp_request);
+    let r = unsafe { &mut *req };
+    r.response.as_mut().map(|resp| &mut **resp)
 }
 
 /// Get the higher-half direct map offset. Limine maps all physical memory at
@@ -169,5 +224,14 @@ pub fn memmap_entries() -> &'static [&'static mut LimineMemmapEntry] {
             ptr as *mut &'static mut LimineMemmapEntry,
             resp.entry_count as usize,
         )
+    }
+}
+
+/// The Local APIC ID of the bootstrap processor, or 0 if there is no Limine MP
+/// response (single CPU).
+pub fn bsp_lapic_id() -> u32 {
+    match mp_response() {
+        Some(resp) => resp.bsp_lapic_id,
+        None => 0,
     }
 }

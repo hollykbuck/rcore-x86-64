@@ -29,6 +29,7 @@ pub struct TaskStateSegment {
 }
 
 impl TaskStateSegment {
+    /// Create an empty TSS (the I/O bitmap base forbids all port accesses).
     pub const fn new() -> Self {
         Self {
             reserved1: 0,

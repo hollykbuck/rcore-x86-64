@@ -46,6 +46,9 @@ disk: build
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=64 2>/dev/null
 	./scripts/mkdisk.sh $(DISK_IMG) $(KERNEL_ELF) $(LIMINE_DIR)
 
+# number of processors (ch8 stage 3 SMP); override with `make run SMP=4`
+SMP ?= 1
+
 run: disk
 	# -icount: make QEMU's TCG virtual clock advance with guest instructions,
 	# so the APIC timer actually preempts the compute-bound apps.
@@ -53,7 +56,7 @@ run: disk
 	# -machine q35: provides the PCIe ECAM (MMIO config space @ 0xB0000000)
 	# used by the virtio-blk-pci driver. The FS image is attached as a
 	# second virtio-blk disk.
-	@qemu-system-x86_64 -machine q35 -hda $(DISK_IMG) -m 256M -no-reboot -nographic \
+	@qemu-system-x86_64 -machine q35 -smp $(SMP) -hda $(DISK_IMG) -m 256M -no-reboot -nographic \
 		-rtc clock=host -icount shift=auto -bios /usr/share/ovmf/OVMF.fd -device isa-debug-exit \
 		-global virtio-blk-pci.disable-legacy=on \
 		-drive file=$(FS_IMG),format=raw,if=virtio

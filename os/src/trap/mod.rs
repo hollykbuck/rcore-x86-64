@@ -20,10 +20,11 @@
 
 mod context;
 mod gdt;
-mod idt;
+pub mod idt;
 pub(crate) mod msr;
-mod tss;
+pub mod tss;
 
+use crate::cpu::current_per_cpu_mut;
 use crate::syscall::syscall;
 use crate::task::{
     SignalFlags, check_signals_error_of_current, current_add_signal, current_trap_cx,
@@ -32,18 +33,18 @@ use crate::task::{
 use crate::timer;
 use context::TRAP_SYSCALL;
 use core::arch::global_asm;
-use gdt::Gdt;
 use idt::InterruptDescriptorTable;
 use lazy_static::*;
 use log::*;
-use tss::TaskStateSegment;
+
+pub use gdt::{Gdt, KERNEL_CS, KERNEL_DS, TSS_SELECTOR};
+pub use tss::TaskStateSegment;
 
 global_asm!(include_str!("trap.S"));
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
-
 lazy_static! {
-    static ref GDT: Gdt = Gdt::new(core::ptr::addr_of!(TSS) as u64);
+    /// the shared IDT (the handler addresses are identical on every core; each
+    /// core `lidt`s it separately)
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
         for i in 0..256 {
@@ -58,31 +59,32 @@ unsafe extern "C" {
     static exception_stub_addrs: [usize; 256];
     safe fn syscall_entry();
     safe fn trap_stack_top();
-    static mut current_stack_top: usize;
 }
 
-/// initialize the CPU (GDT, IDT, syscall MSRs). Page tables are taken over
-/// by [`crate::mm::init`].
-pub fn init() {
-    // set the kernel stack used when an interrupt switches from ring 3 to
-    // ring 0. The task manager overwrites this with the per-task kernel stack
-    // before the first task runs.
-    set_current_stack_top(linker_symbol_addr!(trap_stack_top) as u64);
-    GDT.load();
+/// The virtual address of the `syscall_entry` stub (for the `LSTAR` MSR).
+pub fn syscall_entry_addr() -> u64 {
+    linker_symbol_addr!(syscall_entry) as u64
+}
+
+/// The virtual address of the BSP's initial trap stack top.
+pub fn bsp_trap_stack_top() -> u64 {
+    linker_symbol_addr!(trap_stack_top) as u64
+}
+
+/// Load the shared IDT on the current processor.
+pub fn load_shared_idt() {
     IDT.load();
-    msr::syscall_init(linker_symbol_addr!(syscall_entry) as u64);
 }
 
 /// Switch the kernel stack that the CPU uses for traps to `top`.
 ///
-/// Both the `rsp0` field of the TSS (used for user-mode exceptions) and the
-/// `current_stack_top` global (used by `syscall_entry`) are updated. The task
-/// manager calls this right before switching to another task.
+/// Both the `rsp0` field of this core's TSS (used for user-mode exceptions)
+/// and its `current_stack_top` (used by `syscall_entry`) are updated. The task
+/// manager calls this right before switching to another thread.
 pub fn set_current_stack_top(top: u64) {
-    unsafe {
-        (*core::ptr::addr_of_mut!(TSS)).set_rsp0(top);
-        current_stack_top = top as usize;
-    }
+    let pc = current_per_cpu_mut();
+    pc.current_stack_top = top as usize;
+    pc.tss.set_rsp0(top);
 }
 
 /// The timer interrupt is enabled by the user RFLAGS IF bit (see
@@ -105,9 +107,12 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
             cx.rax = ret as usize;
         }
         32 => {
-            // APIC timer interrupt
+            // APIC timer interrupt (per-core local APIC)
             timer::timer_eoi();
-            timer::tick();
+            // only core 0 drives the global time base
+            if crate::cpu::current_cpu_id() == 0 {
+                timer::tick();
+            }
             timer::set_next_trigger();
             // wake up any threads whose sleep deadline has expired
             timer::check_timer();
@@ -121,9 +126,19 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
                 core::arch::asm!("mov rax, cr2", out("rax") cr2, options(nostack));
             }
             let access = if cx.error_code & 2 != 0 { "store" } else { "load" };
+            // diagnostic: identify the faulting thread and its user RSP
+            let (tid, rsp) = crate::task::current_task()
+                .map(|t| {
+                    let inner = t.inner_exclusive_access();
+                    (
+                        inner.res.as_ref().map(|r| r.tid).unwrap_or(usize::MAX),
+                        inner.get_trap_cx().rsp,
+                    )
+                })
+                .unwrap_or((usize::MAX, 0));
             println!(
-                "[kernel] PageFault in application, {} addr = {:#x}, RIP = {:#x}, kernel killed it.",
-                access, cr2, cx.rip
+                "[kernel] PageFault in application, {} addr = {:#x}, RIP = {:#x}, RSP = {:#x}, tid = {}, kernel killed it.",
+                access, cr2, cx.rip, rsp, tid
             );
             current_add_signal(SignalFlags::SIGSEGV);
         }
@@ -151,16 +166,36 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
 
 #[unsafe(no_mangle)]
 /// A trap that happened in kernel mode (i.e. a kernel bug): report and halt.
-pub extern "C" fn kernel_exception_panic(vector: usize, error_code: usize, fault_rip: usize) -> ! {
+pub extern "C" fn kernel_exception_panic(
+    vector: usize,
+    error_code: usize,
+    fault_rip: usize,
+    fault_cs: usize,
+) -> ! {
     let cr2: u64;
+    let cr3: u64;
     unsafe {
         core::arch::asm!("mov rax, cr2", out("rax") cr2, options(nostack));
+        core::arch::asm!("mov rax, cr3", out("rax") cr3, options(nostack));
     }
     error!(
-        "[kernel] Exception #{} (error_code = {:#x}) occurred in kernel mode, CR2 = {:#x}, RIP = {:#x}, kernel halted.",
-        vector, error_code, cr2, fault_rip
+        "[kernel] Exception #{} (error_code = {:#x}) occurred in kernel mode, CR2 = {:#x}, CR3 = {:#x}, RIP = {:#x}, CS = {:#x}, kernel halted.",
+        vector, error_code, cr2, cr3, fault_rip, fault_cs
     );
     crate::uart::shutdown(true)
+}
+
+#[unsafe(no_mangle)]
+/// The APIC timer interrupt while running in kernel mode (an idle core's
+/// `sti; hlt; cli` wakeup): EOI, advance the clock on core 0, and wake any
+/// threads whose sleep deadline has expired. Returns via `iretq` back to the
+/// idle loop.
+pub extern "C" fn kernel_timer_eoi() {
+    timer::timer_eoi();
+    if crate::cpu::current_cpu_id() == 0 {
+        timer::tick();
+    }
+    timer::check_timer();
 }
 
 pub use context::TrapContext;

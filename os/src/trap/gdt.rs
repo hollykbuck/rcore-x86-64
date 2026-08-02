@@ -56,6 +56,7 @@ pub struct Gdt {
 }
 
 impl Gdt {
+    /// Create a GDT with the given `tss_base` in the TSS descriptor.
     pub fn new(tss_base: u64) -> Self {
         let (tss_low, tss_high) = tss_segment(tss_base);
         Self {

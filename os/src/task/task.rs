@@ -11,7 +11,7 @@ use super::{KernelStack, ProcessControlBlock, TaskContext, kstack_alloc};
 use crate::trap::TrapContext;
 use crate::{sync::UPSafeCell};
 use alloc::sync::{Arc, Weak};
-use core::cell::RefMut;
+use core::sync::atomic::AtomicUsize;
 
 /// A thread of a process (the scheduling unit since ch8).
 pub struct TaskControlBlock {
@@ -19,13 +19,18 @@ pub struct TaskControlBlock {
     pub process: Weak<ProcessControlBlock>,
     /// the kernel stack of this thread
     pub kstack: KernelStack,
+    /// the id of the processor that last ran (or will run) this thread. It is
+    /// the owner of this thread's context save: a woken thread must be parked
+    /// on its owner's pending queue and only re-enter the global ready queue
+    /// after the owner has switched away from it (SMP race, see ch8 stage 3).
+    pub last_cpu: AtomicUsize,
     // mutable
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
     /// Get the mutable reference to the inner structure of the thread.
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> crate::sync::SpinLockGuard<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
 
@@ -74,6 +79,7 @@ impl TaskControlBlock {
         Self {
             process: Arc::downgrade(&process),
             kstack,
+            last_cpu: AtomicUsize::new(0),
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     res: Some(res),

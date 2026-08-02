@@ -28,6 +28,7 @@ mod switch;
 mod task;
 
 use crate::fs::{OpenFlags, open_file};
+
 use crate::uart::shutdown;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -67,8 +68,15 @@ pub fn suspend_current_and_run_next() {
     drop(task_inner);
     // ---- release current TCB
 
-    // push back to ready queue.
-    add_task(task);
+    // SMP: the thread must not re-enter the global ready queue until its
+    // context has been saved by `__switch` below, otherwise another core could
+    // fetch it first and resume stale state. Park it in this core's pending
+    // queue; the idle loop drains it after the switch.
+    crate::cpu::current_per_cpu_mut()
+        .processor
+        .pending_requeue
+        .exclusive_access()
+        .push_back(task);
     // jump to the scheduling cycle
     schedule(task_cx_ptr);
 }
@@ -122,13 +130,18 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // record exit code of main process
         process_inner.exit_code = exit_code;
 
-        {
-            // move all child processes under init process
-            let mut initproc_inner = INITPROC.inner_exclusive_access();
-            for child in process_inner.children.iter() {
-                child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-                initproc_inner.children.push(child.clone());
-            }
+        // Detach the child processes and reparent them to the init process.
+        // The reparenting itself only needs our own lock (the parent field of
+        // the orphans). They are *adopted* by `INITPROC` later, without our
+        // own lock held. On SMP this matters: otherwise the exit path (holds
+        // self, wants INITPROC), the parent's `waitpid` (holds parent, wants
+        // self) and the init process's `waitpid` (holds INITPROC, wants
+        // parent) form a lock cycle `self -> INITPROC -> parent -> self` that
+        // deadlocks whenever the three interleave.
+        let mut orphans: Vec<Arc<ProcessControlBlock>> = Vec::new();
+        for child in process_inner.children.drain(..) {
+            child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
+            orphans.push(child);
         }
 
         // deallocate user res (including tid/ustack) of all threads
@@ -149,10 +162,19 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         // need to collect those user res first, then release process_inner
         // for now to avoid deadlock/double borrow problem.
         drop(process_inner);
+
+        // adopt the orphaned children under the init process (we no longer
+        // hold our own lock, so no lock cycle with the waiting parents)
+        {
+            let mut initproc_inner = INITPROC.inner_exclusive_access();
+            for orphan in orphans.into_iter() {
+                initproc_inner.children.push(orphan);
+            }
+        }
+
         recycle_res.clear();
 
         let mut process_inner = process.inner_exclusive_access();
-        process_inner.children.clear();
         // deallocate other data in user space i.e. program code/data section
         process_inner.memory_set.recycle_data_pages();
         // drop file descriptors
@@ -164,11 +186,21 @@ pub fn exit_current_and_run_next(exit_code: i32) {
         while process_inner.tasks.len() > 1 {
             process_inner.tasks.pop();
         }
+        drop(process_inner);
+        // Park the process on this core: the final drop (which frees the main
+        // thread's kernel stack) must only happen after `__switch` below has
+        // switched away from this very stack. The idle loop releases it.
+        crate::cpu::current_per_cpu_mut().processor.exiting_process = Some(process);
+        // we do not have to save task context
+        let mut _unused = TaskContext::zero_init();
+        schedule(&mut _unused as *mut _);
+        unreachable!();
     }
     drop(process);
     // we do not have to save task context
     let mut _unused = TaskContext::zero_init();
     schedule(&mut _unused as *mut _);
+    unreachable!();
 }
 
 /// Remove a thread from the ready queue and the timer queue (used when the
@@ -176,6 +208,9 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     remove_task(Arc::clone(&task));
     crate::timer::remove_timer(Arc::clone(&task));
+    // SMP: the thread may be parked in some core's pending queue, waiting to
+    // re-enter the ready queue after its context save; remove it there too.
+    crate::task::processor::remove_from_all_pending(task);
 }
 
 lazy_static! {

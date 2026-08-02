@@ -589,6 +589,8 @@ exception_stub_addrs:
 exception_common:
     testq $3, 24(%rsp)          // low 2 bits of CS == CPL
     jz 1f                       // from kernel mode: panic
+    // from user mode: switch GS to this core's PerCpu (user GS base is 0)
+    swapgs
     // save the general purpose registers; RAX must end up at offset 0
     pushq %r15
     pushq %r14
@@ -611,21 +613,45 @@ exception_common:
     jmp restore_all
 
 1:
+    // Exception/interrupt in kernel mode. The only one that can legitimately
+    // happen is the APIC timer while a core is idle (`sti; hlt; cli`): treat
+    // it as a wakeup (EOI + check timers) and return. Anything else is a bug.
+    cmpq $32, (%rsp)
+    jne 2f
+    pushq %rax
+    pushq %rcx
+    pushq %rdx
+    call kernel_timer_eoi
+    popq %rdx
+    popq %rcx
+    popq %rax
+    addq $16, %rsp              // skip vector + error code
+    iretq
+2:
     // Exception in kernel mode: pass the vector number, the error code
-    // (pushed below the vector number by the stub) and the faulting RIP.
+    // (pushed below the vector number by the stub), the faulting RIP and CS.
     movq (%rsp), %rdi           // vector
     movq 8(%rsp), %rsi          // error code
     movq 16(%rsp), %rdx         // faulting RIP
+    movq 24(%rsp), %rcx         // CS
     call kernel_exception_panic
 
 // Entry of the `syscall` instruction, pointed to by the LSTAR MSR.
 // On `syscall`, RCX = user RIP and R11 = user RFLAGS.
 .globl syscall_entry
 syscall_entry:
-    movq %rsp, user_rsp(%rip)   // save the user rsp
-    movq current_stack_top(%rip), %rsp  // switch to the current task's kernel stack
+    swapgs                      // GS = this core's PerCpu
+    // save the user rsp in this core's PerCpu slot (offset 16). It must not
+    // be a global: two cores executing `syscall` concurrently would clobber
+    // each other's saved value and resume with the wrong stack pointer.
+    movq %rsp, %gs:16
+    // switch to this core's current kernel stack. The offset 8 is hardcoded:
+    // `PerCpu` is `#[repr(C)]` with a `usize cpu_id` first field, so
+    // `current_stack_top` sits at offset 8. No register is clobbered here, so
+    // the user `rax` (the syscall number) is preserved for the frame below.
+    movq %gs:8, %rsp
     pushq $0x23                 // SS
-    pushq user_rsp(%rip)        // RSP
+    pushq %gs:16                // RSP
     pushq %r11                  // RFLAGS
     pushq $0x1B                 // CS
     pushq %rcx                  // RIP
@@ -669,26 +695,18 @@ restore_all:
     popq %r14
     popq %r15
     addq $16, %rsp              // skip trap_num and error_code
+    swapgs                      // restore the user GS base
     iretq
 
 // Jump into user mode with a fresh `TrapContext`. The task manager arranges
 // that RSP already points at the `TrapContext` when this label is reached via
-// `__switch`, so nothing needs to be set up here.
+// `__switch`. `GS` currently points at this core's PerCpu (set at
+// initialization); `restore_all` swaps it back to the user GS base (0).
 .globl __restore
 __restore:
     jmp restore_all
 
     .section .bss
-    .balign 8
-user_rsp:
-    .space 8
-// The kernel stack top of the currently running task, kept in sync with
-// `TSS.rsp0` by the task manager. Used by `syscall_entry` (the CPU takes care
-// of the exception path via `TSS.rsp0` itself).
-    .balign 8
-    .globl current_stack_top
-current_stack_top:
-    .space 8
 
 // The trap kernel stack, used as the fallback `current_stack_top` value
 // before the first task starts.

@@ -53,11 +53,19 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 }
 
 /// Wake up a blocked thread: mark it ready and put it back in the queue.
+///
+/// SMP: the thread is not added to the global ready queue directly. It is
+/// parked on the pending queue of its `last_cpu` (the core that owns its
+/// context save); that core's idle loop moves it to the ready queue once the
+/// context has been saved by `__switch`. This closes the race where a woken
+/// thread is resumed by another core before its block path finished saving
+/// its context.
 pub fn wakeup_task(task: Arc<TaskControlBlock>) {
     let mut task_inner = task.inner_exclusive_access();
     task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
-    add_task(task);
+    let owner = task.last_cpu.load(core::sync::atomic::Ordering::Relaxed);
+    super::processor::park_pending(owner, task);
 }
 
 /// Remove a thread from the ready queue (used when a process terminates).

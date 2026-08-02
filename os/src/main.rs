@@ -35,6 +35,7 @@ use log::*;
 #[macro_use]
 mod console;
 mod config;
+mod cpu;
 mod drivers;
 pub mod fs;
 mod lang_items;
@@ -74,10 +75,17 @@ pub fn rust_main() -> ! {
 
     info!("[kernel] Initializing memory management ...");
     mm::init();
-    trap::init();
+    // initialize the bootstrap processor's per-cpu state (GDT/TSS/IDT/MSRs).
+    // `bsp_apic_id` is 0 when no Limine MP response is available (single CPU).
+    let bsp_apic_id = crate::limine_reqs::bsp_lapic_id();
+    cpu::init_all_per_cpu_slots();
+    cpu::init_cpu(0, bsp_apic_id, trap::bsp_trap_stack_top() as usize);
     timer::init();
     trap::enable_timer_interrupt();
     fs::list_apps();
     task::add_initproc();
+    // bring up the application processors (no-op until the Limine MP response
+    // is wired up)
+    cpu::smp_boot_aps();
     task::run_tasks()
 }

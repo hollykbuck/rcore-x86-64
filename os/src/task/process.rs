@@ -15,7 +15,6 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefMut;
 
 /// The process-wide state shared by all threads of the process.
 pub struct ProcessControlBlock {
@@ -84,7 +83,7 @@ impl ProcessControlBlockInner {
 
 impl ProcessControlBlock {
     /// Get the mutable reference to the inner structure of the process.
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
+    pub fn inner_exclusive_access(&self) -> crate::sync::SpinLockGuard<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
 

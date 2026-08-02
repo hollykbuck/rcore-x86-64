@@ -57,12 +57,17 @@ use user_lib::{exec, fork, waitpid};
 
 fn run_tests(tests: &[(&str, &str, &str, &str, i32)]) -> i32 {
     let mut pass_num = 0;
-    let mut arr: [*const u8; 4] = [
+    let mut arr: [*const u8; 5] = [
+        core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
         core::ptr::null::<u8>(),
     ];
+    // argv must be NUL-terminated: `sys_exec` walks the array until a null
+    // pointer (x86-64 port; the 4-entry array was never terminated on RISC-V
+    // either, it only worked because the next stack slot happened to be null).
+    arr[4] = core::ptr::null::<u8>();
 
     for test in tests {
         println!("Usertests: Running {}", test.0);

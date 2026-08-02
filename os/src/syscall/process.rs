@@ -6,8 +6,9 @@ use crate::task::{
     exit_current_and_run_next, pid2process, suspend_current_and_run_next,
 };
 use crate::timer::get_time_ms;
+use log::warn;
+
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// thread exits and submit an exit code
@@ -40,6 +41,13 @@ pub fn sys_fork() -> isize {
     new_pid as isize
 }
 
+/// Maximum number of `argv` entries `sys_exec` will read. The user is supposed
+/// to NUL-terminate the pointer array; without a bound, a corrupted or
+/// out-of-bounds `argv` (e.g. the ch8 `usertests` harness historically did
+/// not NUL-terminate its 4-entry array) would make `translated_str` spin on an
+/// unterminated string.
+const MAX_ARGV: usize = 32;
+
 /// replace the current process with the program named by `path`, which is
 /// loaded from the file system; `args` is a NUL-terminated array of argument
 /// string pointers in the user address space.
@@ -55,6 +63,10 @@ pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
         args_vec.push(translated_str(token, arg_str_ptr as *const u8));
         unsafe {
             args = args.add(1);
+        }
+        if args_vec.len() >= MAX_ARGV {
+            warn!("exec: argv longer than {} entries, truncating", MAX_ARGV);
+            break;
         }
     }
     if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
@@ -92,8 +104,14 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     });
     if let Some((idx, _)) = pair {
         let child = inner.children.remove(idx);
-        // confirm that child will be deallocated after removing from children list
-        assert_eq!(Arc::strong_count(&child), 1);
+        // SMP note: the child process is *not* deallocated here even though
+        // this may be the last reference held by the parent: the exiting
+        // main thread parks its own reference (with the still-live kernel
+        // stack) on the core's `exiting_process` slot and only releases it
+        // after it has switched away. So the kernel stack of the exited main
+        // thread is freed by that core's idle loop, never under the exiting
+        // thread itself. (single-core RISC-V asserted `strong_count == 1`
+        // here, which is not valid under SMP.)
         let found_pid = child.getpid();
         // ++++ temporarily access child TCB exclusively
         let exit_code = child.inner_exclusive_access().exit_code;

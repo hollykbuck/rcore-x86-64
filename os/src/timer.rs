@@ -58,11 +58,15 @@ const APIC_BASE_X2: u64 = 1 << 10;
 const LAPIC_EOI: u32 = 0x0B0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_TIMER_INIT_COUNT: u32 = 0x380;
+#[allow(unused)]
 const LAPIC_TIMER_CURRENT_COUNT: u32 = 0x390;
 const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 
-/// number of completed timer periods (interrupts delivered) since boot
-static WRAPS: AtomicUsize = AtomicUsize::new(0);
+/// number of completed timer periods (interrupts delivered) on the bootstrap
+/// processor since boot. This is the global time base (1 tick = 1 ms at
+/// `TICKS_PER_SEC` Hz). Only core 0's timer interrupt increments it, so it is
+/// independent of the core on which `get_time_ms` happens to run.
+static GLOBAL_TICKS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn rdmsr(msr: u32) -> u64 {
     let mut hi: u32;
@@ -108,6 +112,7 @@ fn lapic_write(offset: u32, value: u32) {
 
 /// Read a local APIC register. Works in both xAPIC (MMIO) and x2APIC (MSR)
 /// modes.
+#[allow(unused)]
 fn lapic_read(offset: u32) -> u32 {
     unsafe {
         let apic_base = rdmsr(APIC_BASE_MSR);
@@ -120,18 +125,8 @@ fn lapic_read(offset: u32) -> u32 {
     }
 }
 
-/// A free-running monotonic tick counter, the analogue of the RISC-V `mtime`.
-///
-/// Reconstructed from the periodic APIC timer: `wraps` counts full periods
-/// delivered by the interrupt handler, and `INITIAL_COUNT - current` is the
-/// number of ticks elapsed within the current period.
-fn elapsed_ticks() -> usize {
-    let current = lapic_read(LAPIC_TIMER_CURRENT_COUNT) as usize;
-    WRAPS.load(AtomicOrdering::Relaxed) * INITIAL_COUNT + (INITIAL_COUNT - current)
-}
-
-/// Initialize the timer: program the APIC timer in periodic mode to interrupt
-/// at `TICKS_PER_SEC` Hz on vector 32.
+/// Program the current core's APIC timer in periodic mode to interrupt at
+/// `TICKS_PER_SEC` Hz on vector 32. Called by every processor.
 pub fn init() {
     // divide by 1
     lapic_write(LAPIC_TIMER_DIVIDE, 0x0B);
@@ -143,9 +138,10 @@ pub fn init() {
 }
 
 /// Count one timer interrupt (one full period elapsed). Called from the timer
-/// interrupt handler.
+/// interrupt handler on the **bootstrap processor only**; this drives the
+/// global time base.
 pub fn tick() {
-    WRAPS.fetch_add(1, AtomicOrdering::Relaxed);
+    GLOBAL_TICKS.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
 /// Send the End-Of-Interrupt to the local APIC. Must be called at the start
@@ -156,10 +152,11 @@ pub fn timer_eoi() {
 
 /// get current time in milliseconds
 ///
-/// Derived from the monotonic APIC-timer counter, so the resolution is 1 ms
-/// (and monotonic by construction).
+/// Derived from the number of periods completed by the bootstrap processor's
+/// APIC timer, so the resolution is 1 ms (and monotonic by construction,
+/// independent of which core calls it).
 pub fn get_time_ms() -> usize {
-    elapsed_ticks() / (APIC_TIMER_FREQ / 1000)
+    GLOBAL_TICKS.load(AtomicOrdering::Relaxed)
 }
 
 /// set the next timer interrupt

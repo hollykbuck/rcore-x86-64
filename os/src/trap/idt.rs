@@ -47,6 +47,7 @@ pub struct InterruptDescriptorTable {
 }
 
 impl InterruptDescriptorTable {
+    /// Create an IDT with all entries empty (interrupt gates, present, DPL 0).
     pub fn new() -> Self {
         Self {
             entries: [empty(); 256],
