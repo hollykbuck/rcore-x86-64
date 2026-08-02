@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INTERRUPT_GATE"],"fn":["empty"],"struct":["IdtEntry","InterruptDescriptorTable"]};
